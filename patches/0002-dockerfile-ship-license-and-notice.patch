@@ -1,0 +1,45 @@
+From d57d543165fe753d9c5085f8d9a5144a9570d288 Mon Sep 17 00:00:00 2001
+From: PathOps <noreply@pathops.dev>
+Date: Mon, 12 Oct 2026 00:52:02 -0300
+Subject: [PATCH] build: ship the Dex license and the PathOps notice in the
+ image
+
+The upstream image does not include the license text. A PathOps image
+redistributes a modified Dex binary, so include the Apache License 2.0
+text and a notice that names the upstream project and points to the
+published patch set.
+---
+ Dockerfile     | 3 +++
+ PATHOPS_NOTICE | 9 +++++++++
+ 2 files changed, 12 insertions(+)
+ create mode 100644 PATHOPS_NOTICE
+
+diff --git a/Dockerfile b/Dockerfile
+index 55817e6..ea12a7f 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -75,6 +75,9 @@ COPY --from=builder /go/bin/dex /usr/local/bin/dex
+ COPY --from=builder /go/bin/docker-entrypoint /usr/local/bin/docker-entrypoint
+ COPY --from=builder /usr/local/src/dex/web /srv/dex/web
+ 
++# PathOps: ship the upstream license and the PathOps modification notice.
++COPY --from=builder /usr/local/src/dex/LICENSE /usr/local/src/dex/PATHOPS_NOTICE /usr/share/doc/pathops-dex/
++
+ COPY --from=gomplate /gomplate /usr/local/bin/gomplate
+ 
+ USER dex:dex
+diff --git a/PATHOPS_NOTICE b/PATHOPS_NOTICE
+new file mode 100644
+index 0000000..a0caa98
+--- /dev/null
++++ b/PATHOPS_NOTICE
+@@ -0,0 +1,9 @@
++PathOps Dex
++
++This image contains Dex (https://github.com/dexidp/dex), licensed under the
++Apache License, Version 2.0. The upstream license is included as LICENSE in
++this directory.
++
++The image was built by PathOps from an exact upstream Dex release with the
++PathOps patch set applied. The upstream release, the patches and the files each
++patch modifies are published at https://github.com/PathOps/pathops-dex.

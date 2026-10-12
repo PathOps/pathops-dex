@@ -1,0 +1,201 @@
+From 3cd220f57faccfb101685ab4e7a8e901510f8e06 Mon Sep 17 00:00:00 2001
+From: PathOps <noreply@pathops.dev>
+Date: Sun, 11 Oct 2026 23:37:40 -0300
+Subject: [PATCH] oidc: optionally validate the audience of token-exchange
+ subject tokens
+
+The OIDC connector verifies RFC 8693 subject ID tokens with
+SkipClientIDCheck, so a valid token from the trusted issuer is accepted
+whatever its audience. Add the opt-in connector option
+subjectTokenAudiences: when set, a subject ID token is accepted only if
+its aud claim contains one of the configured values, and subject access
+tokens are rejected because their audience cannot be verified through
+userinfo. Behavior is unchanged when the option is unset.
+---
+ connector/oidc/oidc.go      |  26 +++++++++
+ connector/oidc/oidc_test.go | 109 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 135 insertions(+)
+
+diff --git a/connector/oidc/oidc.go b/connector/oidc/oidc.go
+index 8b92bb9..42e306a 100644
+--- a/connector/oidc/oidc.go
++++ b/connector/oidc/oidc.go
+@@ -86,6 +86,13 @@ type Config struct {
+ 	// Disable certificate verification
+ 	InsecureSkipVerify bool `json:"insecureSkipVerify"`
+ 
++	// SubjectTokenAudiences restricts RFC 8693 token exchange: when set, a
++	// subject ID token is accepted only if its "aud" claim contains at least one
++	// of these values. Subject access tokens are then rejected, because their
++	// audience cannot be verified through the userinfo endpoint. When empty,
++	// the audience of exchanged subject tokens is not checked.
++	SubjectTokenAudiences []string `json:"subjectTokenAudiences"`
++
+ 	// GetUserInfo uses the userinfo endpoint to get additional claims for
+ 	// the token. This is especially useful where upstreams return "thin"
+ 	// id tokens
+@@ -398,6 +405,7 @@ func (c *Config) Open(id string, logger *slog.Logger) (conn connector.Connector,
+ 		allowedGroups:             c.AllowedGroups,
+ 		acrValues:                 c.AcrValues,
+ 		getUserInfo:               c.GetUserInfo,
++		subjectTokenAudiences:     c.SubjectTokenAudiences,
+ 		promptType:                promptType,
+ 		userIDKey:                 c.UserIDKey,
+ 		userNameKey:               c.UserNameKey,
+@@ -434,6 +442,7 @@ type oidcConnector struct {
+ 	allowedGroups             []string
+ 	acrValues                 []string
+ 	getUserInfo               bool
++	subjectTokenAudiences     []string
+ 	promptType                string
+ 	userIDKey                 string
+ 	userNameKey               string
+@@ -591,10 +600,16 @@ func (c *oidcConnector) createIdentity(ctx context.Context, identity connector.I
+ 			if err != nil {
+ 				return identity, fmt.Errorf("oidc: failed to verify token: %v", err)
+ 			}
++			if len(c.subjectTokenAudiences) > 0 && !audienceAllowed(idToken.Audience, c.subjectTokenAudiences) {
++				return identity, fmt.Errorf("oidc: subject token audience %q is not accepted", idToken.Audience)
++			}
+ 			if err := idToken.Claims(&claims); err != nil {
+ 				return identity, fmt.Errorf("oidc: failed to decode claims: %v", err)
+ 			}
+ 		case "urn:ietf:params:oauth:token-type:access_token":
++			if len(c.subjectTokenAudiences) > 0 {
++				return identity, errors.New("oidc: subjectTokenAudiences requires id_token subject tokens")
++			}
+ 			if !c.getUserInfo {
+ 				return identity, fmt.Errorf("oidc: getUserInfo is required for access token exchange")
+ 			}
+@@ -806,3 +821,14 @@ func (c *oidcConnector) LogoutURL(_ context.Context, postLogoutRedirectURI strin
+ func (c *oidcConnector) HandleLogoutCallback(_ context.Context, _ *http.Request) error {
+ 	return nil
+ }
++
++// audienceAllowed reports whether any audience of a verified token is accepted.
++// go-oidc normalizes a string or array "aud" claim into a slice.
++func audienceAllowed(audiences, accepted []string) bool {
++	for _, aud := range audiences {
++		if contains(accepted, aud) {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/connector/oidc/oidc_test.go b/connector/oidc/oidc_test.go
+index d05d3c1..0a0c130 100644
+--- a/connector/oidc/oidc_test.go
++++ b/connector/oidc/oidc_test.go
+@@ -1206,3 +1206,112 @@ func TestEndSessionURLOverride(t *testing.T) {
+ 	require.NoError(t, err)
+ 	require.Equal(t, "https://custom.example.com/logout", conn.endSessionURL)
+ }
++
++// TestTokenIdentitySubjectTokenAudiences covers the audience check applied to
++// RFC 8693 subject tokens when SubjectTokenAudiences is configured.
++func TestTokenIdentitySubjectTokenAudiences(t *testing.T) {
++	const (
++		tokenTypeID     = "urn:ietf:params:oauth:token-type:id_token"
++		tokenTypeAccess = "urn:ietf:params:oauth:token-type:access_token"
++		stsAudience     = "https://sts.example.com"
++	)
++
++	key, err := rsa.GenerateKey(rand.Reader, 2048)
++	require.NoError(t, err)
++	jwk := jose.JSONWebKey{Key: key, KeyID: "keyId", Algorithm: "RSA"}
++	otherKey, err := rsa.GenerateKey(rand.Reader, 2048)
++	require.NoError(t, err)
++	otherJWK := jose.JSONWebKey{Key: otherKey, KeyID: "keyId", Algorithm: "RSA"}
++
++	var issuer string
++	mux := http.NewServeMux()
++	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
++		json.NewEncoder(w).Encode(map[string]string{
++			"issuer":                 issuer,
++			"token_endpoint":         issuer + "/token",
++			"authorization_endpoint": issuer + "/authorize",
++			"userinfo_endpoint":      issuer + "/userinfo",
++			"jwks_uri":               issuer + "/keys",
++		})
++	})
++	mux.HandleFunc("/keys", func(w http.ResponseWriter, r *http.Request) {
++		json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]any{{
++			"alg": "RS256", "kty": "RSA", "kid": jwk.KeyID, "n": n(&key.PublicKey), "e": e(&key.PublicKey),
++		}}})
++	})
++	mux.HandleFunc("/userinfo", func(w http.ResponseWriter, r *http.Request) {
++		json.NewEncoder(w).Encode(map[string]any{"sub": "subvalue", "name": "namevalue"})
++	})
++	srv := httptest.NewServer(mux)
++	defer srv.Close()
++	issuer = srv.URL
++
++	sign := func(k *jose.JSONWebKey, override map[string]any) string {
++		claims := map[string]any{
++			"iss":  issuer,
++			"sub":  "subvalue",
++			"name": "namevalue",
++			"aud":  []string{stsAudience},
++			"exp":  time.Now().Add(10 * time.Minute).Unix(),
++			"iat":  time.Now().Unix(),
++		}
++		for k, v := range override {
++			claims[k] = v
++		}
++		tok, err := newToken(k, claims)
++		require.NoError(t, err)
++		return tok
++	}
++
++	tests := []struct {
++		name        string
++		audiences   []string
++		getUserInfo bool
++		subjectType string
++		token       string
++		expectError bool
++	}{
++		{name: "expected audience (array)", audiences: []string{stsAudience}, subjectType: tokenTypeID,
++			token: sign(&jwk, nil)},
++		{name: "expected audience (string)", audiences: []string{stsAudience}, subjectType: tokenTypeID,
++			token: sign(&jwk, map[string]any{"aud": stsAudience})},
++		{name: "expected audience among several", audiences: []string{"https://old-sts.example.com", stsAudience}, subjectType: tokenTypeID,
++			token: sign(&jwk, map[string]any{"aud": []string{"unrelated-service", stsAudience}})},
++		{name: "kubernetes API audience", audiences: []string{stsAudience}, subjectType: tokenTypeID,
++			token: sign(&jwk, map[string]any{"aud": []string{"https://kubernetes.default.svc.cluster.local"}}), expectError: true},
++		{name: "unrelated audience (string)", audiences: []string{stsAudience}, subjectType: tokenTypeID,
++			token: sign(&jwk, map[string]any{"aud": "unrelated-service"}), expectError: true},
++		{name: "missing audience", audiences: []string{stsAudience}, subjectType: tokenTypeID,
++			token: sign(&jwk, map[string]any{"aud": nil}), expectError: true},
++		{name: "wrong issuer", audiences: []string{stsAudience}, subjectType: tokenTypeID,
++			token: sign(&jwk, map[string]any{"iss": "https://other-issuer.example.com"}), expectError: true},
++		{name: "expired", audiences: []string{stsAudience}, subjectType: tokenTypeID,
++			token: sign(&jwk, map[string]any{"exp": time.Now().Add(-time.Minute).Unix()}), expectError: true},
++		{name: "signed by another key", audiences: []string{stsAudience}, subjectType: tokenTypeID,
++			token: sign(&otherJWK, nil), expectError: true},
++		{name: "access token rejected when audiences are configured", audiences: []string{stsAudience}, getUserInfo: true,
++			subjectType: tokenTypeAccess, token: sign(&jwk, nil), expectError: true},
++		{name: "unset audiences keep the previous behavior", subjectType: tokenTypeID,
++			token: sign(&jwk, map[string]any{"aud": "unrelated-service"})},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			conn, err := newConnector(Config{
++				Issuer:                srv.URL,
++				Scopes:                []string{"openid"},
++				SubjectTokenAudiences: tc.audiences,
++				GetUserInfo:           tc.getUserInfo,
++			})
++			require.NoError(t, err)
++
++			identity, err := conn.TokenIdentity(context.Background(), tc.subjectType, tc.token)
++			if tc.expectError {
++				require.Error(t, err)
++				return
++			}
++			require.NoError(t, err)
++			expectEquals(t, identity.UserID, "subvalue")
++			expectEquals(t, identity.Username, "namevalue")
++		})
++	}
++}

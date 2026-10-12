@@ -1,0 +1,14 @@
+PathOps Dex
+
+This repository contains build tooling and a patch set for Dex
+(https://github.com/dexidp/dex), which is licensed under the Apache License,
+Version 2.0. Dex source code is not vendored here; it is fetched from the
+upstream release pinned in UPSTREAM_VERSION and UPSTREAM_COMMIT.
+
+The files under patches/ modify Dex. Each patch states the upstream files it
+changes and why. Images built from this repository contain the modified Dex
+binary, the upstream LICENSE and a PathOps notice under
+/usr/share/doc/pathops-dex/.
+
+The build scripts, workflows and patches in this repository are licensed under
+the Apache License, Version 2.0 (see LICENSE).
