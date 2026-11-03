@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Test the patched Dex source: gofmt on patched Go files, go vet and the full
 # upstream unit test suite (database-backed storage tests skip without their
-# environment), plus an explicit run of the PathOps audience test.
+# environment), plus explicit runs of the PathOps audience and delegation
+# tests.
 #
 # usage: scripts/test.sh   (set SKIP_PREPARE=1 to reuse an already prepared tree)
 set -euo pipefail
@@ -30,5 +31,13 @@ out=$(go test ./connector/oidc/ -count=1 -run '^TestTokenIdentitySubjectTokenAud
 echo "$out" | grep -E -- '--- (PASS|FAIL)'
 grep -q -- '--- PASS: TestTokenIdentitySubjectTokenAudiences ' <<< "$out" \
   || { echo "test: TestTokenIdentitySubjectTokenAudiences did not run and pass" >&2; exit 1; }
+
+echo "test: PathOps delegation tests"
+out=$(go test ./server/ ./server/delegation/ ./storage/kubernetes/ -count=1 -run 'Delegation|NewPolicy|AudiencePattern' -v)
+echo "$out" | grep -E -- '^--- (PASS|FAIL)'
+for t in TestDelegationFlow TestDelegationOperationsAreSeparate TestDelegationPushedRequestChecks TestDelegationConsent \
+  TestDelegationCanonical TestNewPolicy TestDelegationFieldRoundTrip; do
+  grep -q -- "--- PASS: $t " <<< "$out" || { echo "test: $t did not run and pass" >&2; exit 1; }
+done
 
 echo "test: OK"

@@ -12,6 +12,12 @@ Current patch set:
   RFC 8693 token exchange.
 - `0002`: packaging only. Ships the upstream license and a PathOps notice
   inside the image.
+- `0003`: opt-in operation-scoped delegated authorization (PathOps Decision
+  0050): pushed authorization requests (RFC 9126) carrying RAR
+  `authorization_details` (RFC 9396) and a delegate-signed PathOps
+  Authorization Plan, a per-operation consent screen, operation grants, and
+  Step-scoped tool tokens derived by the delegate. See
+  [Delegation](#delegation).
 
 Long-term goal: remove the functional patch once equivalent functionality is
 available upstream, and consume official Dex images again.
@@ -54,10 +60,76 @@ Run the image with `DEX_CONFIG_DISALLOW_UNKNOWN_FIELDS=true`. An unpatched Dex
 then refuses to start with this configuration instead of silently ignoring the
 option.
 
+## Delegation
+
+Patch `0003` adds an opt-in `delegation` section. It lets a confidential
+*delegate* (the PathOps Tenant Control Plane) act for a user only within one
+operation the user approved, without ever handling the user's own tokens.
+
+```yaml
+delegation:
+  planClients: [pathops-cli]          # public clients that push plans (PAR)
+  pushedRequestsValidFor: 90s         # request_uri lifetime (single use)
+  maxPlanLifetime: 15m                # exp - iat of a plan
+  grantsValidFor: 15m                 # operation grant, from approval
+  tokensValidFor: 5m                  # derived tool token, never beyond the grant
+  delegates:
+    - client: pathops-tenant-control-plane   # a confidential staticClient
+      name: PathOps Tenant Control Plane     # shown on the consent screen
+      planIssuer: https://tcp.example.org    # "iss" of its plans
+      planKeys:
+        - {kid: tcp-plan-1, ed25519: <base64url raw public key>}
+      tools:
+        - name: forgejo
+          displayName: Forgejo
+          audiencePattern: 'u:[0-9]+:[0-9a-f-]{36}'
+          detailTypes: [pathops_repository, pathops_webhook]
+```
+
+Flow:
+
+1. The delegate computes the exact `authorization_details` of one operation
+   and signs an **Authorization Plan** (EdDSA JWS, `typ`
+   `pathops-authorization-plan+jwt`) binding them to the user (`sub`), the
+   operation, its Application/Run, template provenance, the plan client and
+   its redirect URI, the PKCE challenge (S256), each tool's audience and the
+   SHA-256 of the canonical details. It is a delegate attestation, not an
+   RFC 9101 Request Object.
+2. The plan client (the PathOps CLI, a public client) pushes the request to
+   `POST /par` with `authorization_details` and `pathops_authorization_plan`.
+   Dex verifies the signature with the delegate's key and requires the pushed
+   details to equal the plan's in canonical JSON (RFC 8785 restricted to
+   ASCII strings and safe integers); any added, dropped, reordered or changed
+   detail, PKCE challenge, redirect URI, client or subject fails. Dex answers
+   a `request_uri` valid 90 s and usable once.
+3. `/auth?client_id=…&request_uri=…` runs the normal login. The authenticated
+   user must be the plan's subject. The consent screen (`delegation.html`)
+   always shows, whatever `skipApprovalScreen` or stored consents say, and
+   lists the operation's resources. `authorization_details` and plans are
+   refused on the front channel.
+4. Approval records an **operation grant** in the user's `UserIdentity`
+   (reserved `Consents` key, no schema change). It becomes active only when
+   the client redeems the code with the PKCE verifier; that token response
+   carries the approved `authorization_details`.
+5. The delegate, authenticated with its client secret, derives a tool token
+   with an RFC 8693 token exchange whose `subject_token` is the operation
+   grant handle `pog1:<plan id>:<sub>` (`subject_token_type`
+   `urn:pathops:params:oauth:token-type:operation-grant`), an `audience` and a
+   subset of the grant's details. The token has `aud` = that tool audience
+   (one value), `azp` = the delegate, the user's `sub`, exactly the requested
+   details, a lifetime of at most `tokensValidFor` and never beyond the grant,
+   and no refresh token. Public clients, other clients, other users' or
+   other operations' grants, wider details and other audiences are refused.
+
+The in-flight plan rides on a new `Delegation` field of auth requests and auth
+codes, kept by the kubernetes and memory storages; Dex refuses to start with
+`delegation` on other storages, and the frontend must provide
+`delegation.html` (the bundled web directory does).
+
 ## Image
 
 ```text
-docker.io/gborba/pathops-dex:v2.46.0-pathops.1
+docker.io/gborba/pathops-dex:v2.46.0-pathops.<n>
 ```
 
 - Releases are published only by the `release` workflow, from tags. There is

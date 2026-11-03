@@ -1,0 +1,3089 @@
+From 165b483b610de250bf662b1043dbc299e765b90a Mon Sep 17 00:00:00 2001
+From: PathOps <noreply@pathops.dev>
+Date: Tue, 3 Nov 2026 09:10:35 -0300
+Subject: [PATCH] delegation: operation-scoped delegated authorization (PAR,
+ RAR, signed plans)
+
+Add the opt-in "delegation" configuration for PathOps operation-scoped human
+delegated authorization (PathOps Decision 0050):
+
+- a pushed authorization request endpoint (RFC 9126, /par) for configured
+  public plan clients. The request carries RAR authorization_details
+  (RFC 9396) and a PathOps Authorization Plan: an EdDSA JWS by a configured
+  delegate that binds subject, operation, Application/Run, client, redirect
+  URI, PKCE challenge, tool audiences and the exact details. Dex verifies the
+  signature and requires the pushed details to equal the plan's in canonical
+  JSON; request_uri values are short-lived and single-use;
+- authorization_details and the plan are refused on the front channel;
+- a per-operation consent screen (delegation.html) that skipApprovalScreen
+  and stored consents never bypass; the authenticated user must be the
+  plan's subject;
+- an operation grant stored in the user's UserIdentity (reserved Consents
+  key), approved on consent and activated only when the code is redeemed
+  with the plan's PKCE verifier; the code response carries the approved
+  authorization_details;
+- a delegated derivation for the plan's delegate, an authenticated
+  confidential client: an RFC 8693 token exchange whose subject is the
+  operation grant handle (never a user token) mints a token with one
+  audience, a subset of the approved details, azp = the delegate, a lifetime
+  of at most tokensValidFor and never beyond the grant, and no refresh token;
+- discovery advertises the PAR endpoint and the detail types.
+
+The delegation state rides on a new AuthRequest/AuthCode field kept by the
+kubernetes and memory storages; Dex refuses delegation with other storages.
+Without the configuration, behavior is unchanged.
+---
+ cmd/dex/config.go                     |   4 +
+ cmd/dex/serve.go                      |  16 +
+ server/authflow/dispatch.go           |  28 ++
+ server/authflow/handler.go            |   8 +
+ server/authflow/login.go              |  13 +
+ server/authflow/par.go                | 123 ++++++
+ server/authflow/request.go            |  55 ++-
+ server/authflow/response.go           |   1 +
+ server/config.go                      |   5 +
+ server/consent/consent.go             |  88 ++++
+ server/delegation/canonical.go        | 171 ++++++++
+ server/delegation/delegation.go       | 291 +++++++++++++
+ server/delegation/delegation_test.go  |  60 +++
+ server/delegation/derive.go           |  84 ++++
+ server/delegation/flow.go             |  40 ++
+ server/delegation/grant.go            | 223 ++++++++++
+ server/delegation/plan.go             | 398 +++++++++++++++++
+ server/discovery/discovery.go         |  11 +
+ server/grants/authcode.go             |  31 ++
+ server/grants/delegation.go           |  76 ++++
+ server/grants/grants.go               |  24 +-
+ server/server.go                      |  10 +
+ server/server_delegation_test.go      | 600 ++++++++++++++++++++++++++
+ server/templates/templates.go         |  34 ++
+ server/tokens/authorization.go        |   3 +
+ storage/kubernetes/delegation_test.go |  24 ++
+ storage/kubernetes/types.go           |  12 +-
+ storage/storage.go                    |   9 +
+ web/templates/delegation.html         |  55 +++
+ 29 files changed, 2492 insertions(+), 5 deletions(-)
+ create mode 100644 server/authflow/par.go
+ create mode 100644 server/delegation/canonical.go
+ create mode 100644 server/delegation/delegation.go
+ create mode 100644 server/delegation/delegation_test.go
+ create mode 100644 server/delegation/derive.go
+ create mode 100644 server/delegation/flow.go
+ create mode 100644 server/delegation/grant.go
+ create mode 100644 server/delegation/plan.go
+ create mode 100644 server/grants/delegation.go
+ create mode 100644 server/server_delegation_test.go
+ create mode 100644 storage/kubernetes/delegation_test.go
+ create mode 100644 web/templates/delegation.html
+
+diff --git a/cmd/dex/config.go b/cmd/dex/config.go
+index 7b17a95..ecb995e 100644
+--- a/cmd/dex/config.go
++++ b/cmd/dex/config.go
+@@ -18,6 +18,7 @@ import (
+ 	"github.com/dexidp/dex/pkg/featureflags"
+ 	"github.com/dexidp/dex/server"
+ 	"github.com/dexidp/dex/server/connectors"
++	"github.com/dexidp/dex/server/delegation"
+ 	"github.com/dexidp/dex/server/signer"
+ 	"github.com/dexidp/dex/storage"
+ 	"github.com/dexidp/dex/storage/ent"
+@@ -75,6 +76,9 @@ type Config struct {
+ 
+ 	// MFA holds multi-factor authentication configuration.
+ 	MFA MFAConfig `json:"mfa"`
++
++	// Delegation enables PathOps operation-scoped delegated authorization.
++	Delegation *delegation.Config `json:"delegation"`
+ }
+ 
+ // MFAConfig holds multi-factor authentication settings.
+diff --git a/cmd/dex/serve.go b/cmd/dex/serve.go
+index 271a904..e5e66ff 100644
+--- a/cmd/dex/serve.go
++++ b/cmd/dex/serve.go
+@@ -43,6 +43,7 @@ import (
+ 	"github.com/dexidp/dex/server/apiserver"
+ 	"github.com/dexidp/dex/server/authflow"
+ 	"github.com/dexidp/dex/server/connectors"
++	"github.com/dexidp/dex/server/delegation"
+ 	"github.com/dexidp/dex/server/mfa"
+ 	"github.com/dexidp/dex/server/session"
+ 	"github.com/dexidp/dex/server/signer"
+@@ -397,6 +398,21 @@ func runServe(options serveOptions) error {
+ 		DefaultMFAChain:            c.MFA.DefaultMFAChain,
+ 	}
+ 
++	if c.Delegation != nil {
++		// The in-flight plan rides on AuthRequest/AuthCode.Delegation, which
++		// only these storages keep.
++		if c.Storage.Type != "kubernetes" && c.Storage.Type != "memory" {
++			return fmt.Errorf("delegation requires the kubernetes or memory storage, not %q", c.Storage.Type)
++		}
++		policy, err := delegation.NewPolicy(*c.Delegation)
++		if err != nil {
++			return fmt.Errorf("invalid delegation config: %v", err)
++		}
++		serverConfig.Delegation = policy
++		logger.Info("config delegation", "plan_clients", c.Delegation.PlanClients, "delegates", len(c.Delegation.Delegates),
++			"grants_valid_for", policy.GrantsValidFor(), "tokens_valid_for", policy.TokensValidFor())
++	}
++
+ 	if c.Expiry.AuthRequests != "" {
+ 		authRequests, err := time.ParseDuration(c.Expiry.AuthRequests)
+ 		if err != nil {
+diff --git a/server/authflow/dispatch.go b/server/authflow/dispatch.go
+index 02d81d8..8602011 100644
+--- a/server/authflow/dispatch.go
++++ b/server/authflow/dispatch.go
+@@ -12,6 +12,7 @@ import (
+ 	"net/http"
+ 
+ 	"github.com/dexidp/dex/server/consent"
++	"github.com/dexidp/dex/server/delegation"
+ 	"github.com/dexidp/dex/server/internal"
+ 	"github.com/dexidp/dex/server/oauth2"
+ 	"github.com/dexidp/dex/storage"
+@@ -81,6 +82,33 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, authReq stora
+ 		}
+ 	}
+ 
++	// A PathOps authorization plan always needs this request's own consent: no
++	// stored consent or skipApprovalScreen applies to an operation.
++	if len(authReq.Delegation) > 0 {
++		if _, err := delegation.CheckAuthRequest(authReq, h.Now()); err != nil || h.Delegation == nil {
++			h.Logger.WarnContext(ctx, "delegation request refused", "client_id", authReq.ClientID, "err", err)
++			if err := h.Storage.DeleteAuthRequest(ctx, authReq.ID); err != nil && err != storage.ErrNotFound {
++				h.Logger.ErrorContext(ctx, "failed to delete auth request", "err", err)
++			}
++			msg := "Invalid authorization request."
++			if err != nil {
++				msg = err.Error()
++			}
++			h.renderError(r, w, http.StatusForbidden, msg)
++			return
++		}
++		if !consentApproved {
++			if prompt.None() {
++				h.redirectWithError(w, r, &authReq, oauth2.InteractionRequired, "User interaction required")
++				return
++			}
++			http.Redirect(w, r, h.buildApprovalURL(authReq), http.StatusSeeOther)
++			return
++		}
++		h.writeResponse(w, r, authReq)
++		return
++	}
++
+ 	// Consent: the "approved" verifier resolves it for this request; otherwise ask
+ 	// whether it can be skipped from persisted state.
+ 	if !consentApproved && !consent.Satisfied(ctx, h.Storage, h.SkipApproval, &authReq) {
+diff --git a/server/authflow/handler.go b/server/authflow/handler.go
+index c24731d..a0a25bc 100644
+--- a/server/authflow/handler.go
++++ b/server/authflow/handler.go
+@@ -7,6 +7,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/dexidp/dex/server/connectors"
++	"github.com/dexidp/dex/server/delegation"
+ 	"github.com/dexidp/dex/server/oauth2"
+ 	"github.com/dexidp/dex/server/router"
+ 	"github.com/dexidp/dex/server/session"
+@@ -48,6 +49,10 @@ type Handler struct {
+ 	DefaultMFAChain []string
+ 	// SkipApproval disables the consent screen server-wide (see consent.Satisfied).
+ 	SkipApproval bool
++
++	// Delegation enables PathOps operation-scoped delegation: the pushed
++	// authorization request endpoint and request_uri (nil: disabled).
++	Delegation *delegation.Policy
+ }
+ 
+ // Mount registers the login routes. The /auth endpoint is both the entry
+@@ -65,6 +70,9 @@ func (h *Handler) Mount(m router.Mux) {
+ 		h.handleConnectorCallback(w, r)
+ 	})
+ 	m.HandleFunc("/callback/{connector}", h.handleConnectorCallback)
++	if h.Delegation != nil {
++		m.HandleFunc("/par", h.handlePAR)
++	}
+ }
+ 
+ // stripRemoteHeaders drops the X-Remote-* request headers the authproxy
+diff --git a/server/authflow/login.go b/server/authflow/login.go
+index e0584a7..b45be9d 100644
+--- a/server/authflow/login.go
++++ b/server/authflow/login.go
+@@ -15,6 +15,7 @@ import (
+ 
+ 	"github.com/dexidp/dex/connector"
+ 	"github.com/dexidp/dex/server/connectors"
++	"github.com/dexidp/dex/server/delegation"
+ 	"github.com/dexidp/dex/server/oauth2"
+ 	"github.com/dexidp/dex/server/tokens"
+ 	"github.com/dexidp/dex/storage"
+@@ -84,6 +85,18 @@ func (h *Handler) handleConnectorLogin(w http.ResponseWriter, r *http.Request) {
+ 
+ 	authReq.ConnectorID = connID
+ 
++	// A request started from a request_uri consumes its pushed request: the
++	// delete succeeds once, so a request_uri starts at most one flow.
++	if d, _ := delegation.DecodeRequest(authReq.Delegation); d != nil && d.PushedID != "" {
++		if err := h.Storage.DeleteAuthRequest(ctx, d.PushedID); err != nil {
++			h.Logger.InfoContext(r.Context(), "pushed authorization request already used or gone", "err", err)
++			h.renderError(r, w, http.StatusBadRequest, errPushedUnusable)
++			return
++		}
++		d.PushedID = ""
++		authReq.Delegation = d.Encode()
++	}
++
+ 	// Actually create the auth request
+ 	authReq.Expiry = h.Now().Add(h.AuthRequestsValidFor)
+ 	if err := h.Storage.CreateAuthRequest(ctx, *authReq); err != nil {
+diff --git a/server/authflow/par.go b/server/authflow/par.go
+new file mode 100644
+index 0000000..9d2624d
+--- /dev/null
++++ b/server/authflow/par.go
+@@ -0,0 +1,123 @@
++package authflow
++
++// par.go is the pushed authorization request endpoint (RFC 9126) of PathOps
++// delegation: the public client pushes an authorization request carrying RAR
++// authorization_details and the delegate's signed Authorization Plan, and gets
++// a short-lived, single-use request_uri for the browser.
++
++import (
++	"crypto/subtle"
++	"encoding/json"
++	"net/http"
++	"net/url"
++	"slices"
++
++	"github.com/dexidp/dex/server/delegation"
++	"github.com/dexidp/dex/server/oauth2"
++	"github.com/dexidp/dex/storage"
++)
++
++func (h *Handler) handlePAR(w http.ResponseWriter, r *http.Request) {
++	ctx := r.Context()
++	fail := func(status int, typ, description string) {
++		oauth2.WriteErrorResponse(h.Logger, w, typ, description, status)
++	}
++	if r.Method != http.MethodPost {
++		fail(http.StatusMethodNotAllowed, oauth2.InvalidRequest, "method not allowed")
++		return
++	}
++	r.Body = http.MaxBytesReader(w, r.Body, 256<<10)
++	if err := r.ParseForm(); err != nil {
++		fail(http.StatusBadRequest, oauth2.InvalidRequest, "the request body is not a form")
++		return
++	}
++	form := r.PostForm
++	if form.Get("request_uri") != "" {
++		fail(http.StatusBadRequest, oauth2.InvalidRequest, "request_uri is not allowed in a pushed authorization request")
++		return
++	}
++
++	// Client authentication: a public client only names itself; a
++	// confidential client must present its secret.
++	clientID, secret := form.Get("client_id"), form.Get("client_secret")
++	if id, s, ok := r.BasicAuth(); ok {
++		var err error
++		if clientID, err = url.QueryUnescape(id); err != nil {
++			fail(http.StatusBadRequest, oauth2.InvalidRequest, "client_id improperly encoded")
++			return
++		}
++		if secret, err = url.QueryUnescape(s); err != nil {
++			fail(http.StatusBadRequest, oauth2.InvalidRequest, "client_secret improperly encoded")
++			return
++		}
++	}
++	client, err := h.Storage.GetClient(ctx, clientID)
++	if err != nil {
++		if err != storage.ErrNotFound {
++			h.Logger.ErrorContext(ctx, "failed to get client", "err", err)
++			fail(http.StatusInternalServerError, oauth2.ServerError, "")
++			return
++		}
++		fail(http.StatusUnauthorized, oauth2.InvalidClient, "Invalid client credentials.")
++		return
++	}
++	if !client.Public && subtle.ConstantTimeCompare([]byte(client.Secret), []byte(secret)) != 1 {
++		fail(http.StatusUnauthorized, oauth2.InvalidClient, "Invalid client credentials.")
++		return
++	}
++	if !h.Delegation.PlanClient(client.ID) {
++		fail(http.StatusBadRequest, "unauthorized_client", "this client may not push authorization requests")
++		return
++	}
++	form.Set("client_id", client.ID)
++
++	authReq, _, err := h.parseAuthorizationParams(ctx, form, true)
++	if err != nil {
++		switch e := err.(type) {
++		case *redirectedAuthErr:
++			fail(http.StatusBadRequest, e.Type, e.Description)
++		case *displayedAuthErr:
++			fail(http.StatusBadRequest, oauth2.InvalidRequest, e.Description)
++		default:
++			fail(http.StatusInternalServerError, oauth2.ServerError, "")
++		}
++		return
++	}
++	if !slices.Equal(authReq.ResponseTypes, []string{oauth2.ResponseTypeCode}) {
++		fail(http.StatusBadRequest, oauth2.InvalidRequest, "an authorization plan requires response_type=code")
++		return
++	}
++	plan, err := h.Delegation.VerifyPlan(form.Get(delegation.PlanParam), h.IssuerURL.String(), h.Now())
++	if err != nil {
++		h.Logger.InfoContext(ctx, "pushed authorization request refused", "client_id", client.ID, "err", err)
++		fail(http.StatusBadRequest, oauth2.InvalidRequest, err.Error())
++		return
++	}
++	if err := plan.MatchPushed(authReq.ClientID, authReq.RedirectURI, authReq.PKCE.CodeChallenge,
++		authReq.PKCE.CodeChallengeMethod, form.Get(delegation.DetailsParam)); err != nil {
++		h.Logger.InfoContext(ctx, "pushed authorization request refused", "client_id", client.ID, "plan", plan.ID, "err", err)
++		fail(http.StatusBadRequest, "invalid_authorization_details", err.Error())
++		return
++	}
++
++	authReq.Delegation = (&delegation.Request{Pushed: true, Plan: *plan}).Encode()
++	authReq.ForceApprovalPrompt = true
++	ttl := h.Delegation.PushedRequestsValidFor()
++	authReq.Expiry = h.Now().Add(ttl)
++	if err := h.Storage.CreateAuthRequest(ctx, *authReq); err != nil {
++		h.Logger.ErrorContext(ctx, "failed to store pushed authorization request", "err", err)
++		fail(http.StatusInternalServerError, oauth2.ServerError, "")
++		return
++	}
++	h.Logger.InfoContext(ctx, "pushed authorization request accepted", "client_id", client.ID, "plan", plan.ID,
++		"delegate", plan.Delegate, "operation", plan.Operation, "application", plan.Application.Name, "run", plan.Run.ID)
++
++	body, _ := json.Marshal(struct {
++		RequestURI string `json:"request_uri"`
++		ExpiresIn  int    `json:"expires_in"`
++	}{delegation.RequestURIPrefix + authReq.ID, int(ttl.Seconds())})
++	w.Header().Set("Content-Type", "application/json")
++	w.Header().Set("Cache-Control", "no-store")
++	w.WriteHeader(http.StatusCreated)
++	w.Write(body)
++}
+diff --git a/server/authflow/request.go b/server/authflow/request.go
+index 4b47887..a09bfc8 100644
+--- a/server/authflow/request.go
++++ b/server/authflow/request.go
+@@ -14,6 +14,7 @@ import (
+ 	"github.com/coreos/go-oidc/v3/oidc"
+ 
+ 	conns "github.com/dexidp/dex/server/connectors"
++	"github.com/dexidp/dex/server/delegation"
+ 	"github.com/dexidp/dex/server/oauth2"
+ 	"github.com/dexidp/dex/server/signer"
+ 	"github.com/dexidp/dex/server/tokens"
+@@ -176,11 +177,19 @@ func (h *Handler) validateIDTokenHint(ctx context.Context, hint string) (*oidc.I
+ // request, the raw subject from id_token_hint (empty if not provided), and any
+ // error (a *displayedAuthErr or *redirectedAuthErr).
+ func (h *Handler) parseAuthorizationRequest(r *http.Request) (*storage.AuthRequest, string, error) {
+-	ctx := r.Context()
+ 	if err := r.ParseForm(); err != nil {
+ 		return nil, "", newDisplayedErr(http.StatusBadRequest, "Failed to parse request.")
+ 	}
+-	q := r.Form
++	if r.Form.Get("request_uri") != "" {
++		return h.pushedAuthorizationRequest(r.Context(), r.Form)
++	}
++	return h.parseAuthorizationParams(r.Context(), r.Form, false)
++}
++
++// parseAuthorizationParams validates authorization request parameters: those
++// of an /auth request, or (pushed) the body of a pushed authorization request,
++// the only place PathOps authorization_details are accepted.
++func (h *Handler) parseAuthorizationParams(ctx context.Context, q url.Values, pushed bool) (*storage.AuthRequest, string, error) {
+ 	// r.ParseForm already URL-decodes query values once; decoding redirect_uri a
+ 	// second time created a normalization differential with the token endpoint.
+ 	redirectURI := q.Get("redirect_uri")
+@@ -237,6 +246,12 @@ func (h *Handler) parseAuthorizationRequest(r *http.Request) (*storage.AuthReque
+ 		}
+ 	}
+ 
++	// Rich authorization requests (PathOps delegation) must be pushed (PAR), so
++	// the signed plan and its details never travel through the browser.
++	if !pushed && (q.Get(delegation.DetailsParam) != "" || q.Get(delegation.PlanParam) != "") {
++		return nil, "", newredirectedAuthErr(oauth2.InvalidRequest, "authorization_details must be sent in a pushed authorization request.")
++	}
++
+ 	// dex doesn't support the request parameter and must return request_not_supported.
+ 	// https://openid.net/specs/openid-connect-core-1_0.html#6.1
+ 	if q.Get("request") != "" {
+@@ -382,3 +397,39 @@ func (h *Handler) parseAuthorizationRequest(r *http.Request) (*storage.AuthReque
+ 		HMACKey: storage.NewHMACKey(crypto.SHA256),
+ 	}, idTokenHintSubject, nil
+ }
++
++// errPushedUnusable is shown for a request_uri that cannot start a flow.
++const errPushedUnusable = "The request_uri is unknown, expired or already used."
++
++// pushedAuthorizationRequest resolves an /auth request_uri (RFC 9126 §4) to a
++// new authorization request with the pushed parameters, which replace every
++// other parameter of the request. The pushed request is consumed when the new
++// request is stored (handleConnectorLogin), so a request_uri starts at most
++// one flow.
++func (h *Handler) pushedAuthorizationRequest(ctx context.Context, q url.Values) (*storage.AuthRequest, string, error) {
++	id, ok := strings.CutPrefix(q.Get("request_uri"), delegation.RequestURIPrefix)
++	if !ok || id == "" || h.Delegation == nil {
++		return nil, "", newDisplayedErr(http.StatusBadRequest, errPushedUnusable)
++	}
++	pushed, err := h.Storage.GetAuthRequest(ctx, id)
++	if err != nil {
++		if err != storage.ErrNotFound {
++			h.Logger.ErrorContext(ctx, "failed to get pushed authorization request", "err", err)
++			return nil, "", newDisplayedErr(http.StatusInternalServerError, "Database error.")
++		}
++		return nil, "", newDisplayedErr(http.StatusBadRequest, errPushedUnusable)
++	}
++	d, err := delegation.DecodeRequest(pushed.Delegation)
++	if err != nil || d == nil || !d.Pushed || !h.Now().Before(pushed.Expiry) {
++		return nil, "", newDisplayedErr(http.StatusBadRequest, errPushedUnusable)
++	}
++	if q.Get("client_id") != pushed.ClientID {
++		return nil, "", newDisplayedErr(http.StatusBadRequest, "client_id does not match the request_uri.")
++	}
++	req := pushed
++	req.ID = storage.NewID()
++	req.HMACKey = storage.NewHMACKey(crypto.SHA256)
++	d.Pushed, d.PushedID = false, pushed.ID
++	req.Delegation = d.Encode()
++	return &req, "", nil
++}
+diff --git a/server/authflow/response.go b/server/authflow/response.go
+index 3a63e25..c356328 100644
+--- a/server/authflow/response.go
++++ b/server/authflow/response.go
+@@ -167,6 +167,7 @@ func (h *Handler) issueCode(ctx context.Context, w http.ResponseWriter, r *http.
+ 		ConnectorData: authReq.ConnectorData,
+ 		PKCE:          authReq.PKCE,
+ 		AuthTime:      authReq.AuthTime,
++		Delegation:    authReq.Delegation,
+ 	}
+ 	if err := h.Storage.CreateAuthCode(ctx, resp.code); err != nil {
+ 		h.Logger.ErrorContext(r.Context(), "Failed to create auth code", "err", err)
+diff --git a/server/config.go b/server/config.go
+index 554d37c..bd9174b 100644
+--- a/server/config.go
++++ b/server/config.go
+@@ -16,6 +16,7 @@ import (
+ 	"github.com/prometheus/client_golang/prometheus"
+ 
+ 	"github.com/dexidp/dex/server/authflow"
++	"github.com/dexidp/dex/server/delegation"
+ 	"github.com/dexidp/dex/server/mfa"
+ 	"github.com/dexidp/dex/server/oauth2"
+ 	"github.com/dexidp/dex/server/session"
+@@ -60,6 +61,10 @@ type Config struct {
+ 	// Logging in implies approval.
+ 	SkipApprovalScreen bool
+ 
++	// Delegation enables PathOps operation-scoped delegation (PAR, RAR,
++	// signed Authorization Plans, operation grants). Nil: disabled.
++	Delegation *delegation.Policy
++
+ 	// If enabled, the connectors selection page will always be shown even if there's only one
+ 	AlwaysShowLoginScreen bool
+ 
+diff --git a/server/consent/consent.go b/server/consent/consent.go
+index e69d5da..e9fe147 100644
+--- a/server/consent/consent.go
++++ b/server/consent/consent.go
+@@ -4,7 +4,10 @@ import (
+ 	"context"
+ 	"log/slog"
+ 	"net/http"
++	"net/url"
++	"time"
+ 
++	"github.com/dexidp/dex/server/delegation"
+ 	"github.com/dexidp/dex/server/internal"
+ 	"github.com/dexidp/dex/server/oauth2"
+ 	"github.com/dexidp/dex/server/router"
+@@ -25,6 +28,11 @@ type Handler struct {
+ 	IssuerURL    oauth2.IssuerURL
+ 	Sessions     *session.Manager
+ 	SkipApproval bool
++	// Delegation renders and records consent to PathOps Authorization Plans
++	// (nil: disabled; such requests never reach this handler).
++	Delegation *delegation.Policy
++	// Now is the clock of delegation checks (default time.Now).
++	Now func() time.Time
+ }
+ 
+ // renderError renders a user-facing HTML error page.
+@@ -88,6 +96,11 @@ func (h *Handler) handleApproval(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	if len(authReq.Delegation) > 0 {
++		h.handleDelegationApproval(w, r, authReq)
++		return
++	}
++
+ 	switch r.Method {
+ 	case http.MethodGet:
+ 		// The dispatcher routes here only when consent is required, so just show
+@@ -143,3 +156,78 @@ func scopesCoveredByConsent(approved, requested []string) bool {
+ 
+ 	return true
+ }
++
++// handleDelegationApproval shows a PathOps Authorization Plan (GET) and, on
++// approval (POST), records the operation grant. The grant becomes usable only
++// when the client redeems the authorization code with the plan's PKCE
++// verifier. A refusal returns access_denied to the client.
++func (h *Handler) handleDelegationApproval(w http.ResponseWriter, r *http.Request, authReq storage.AuthRequest) {
++	ctx := r.Context()
++	now := time.Now
++	if h.Now != nil {
++		now = h.Now
++	}
++	d, err := delegation.CheckAuthRequest(authReq, now())
++	if err != nil || d == nil || h.Delegation == nil {
++		msg := "Invalid authorization request."
++		if err != nil {
++			msg = err.Error()
++		}
++		h.renderError(r, w, http.StatusForbidden, msg)
++		return
++	}
++	plan := d.Plan
++	switch r.Method {
++	case http.MethodGet:
++		page := templates.DelegationPage{
++			AuthReqID:   authReq.ID,
++			User:        authReq.Claims.Email,
++			Delegate:    h.Delegation.DelegateName(plan.Delegate),
++			Operation:   plan.Operation,
++			Application: plan.Application.Name,
++			Run:         plan.Run.ID,
++			Template:    plan.Template.ID + " (" + plan.Template.Source + " @ " + plan.Template.Ref + ")",
++			Items:       h.Delegation.Describe(&plan),
++			Details:     string(plan.Details),
++			GrantTTL:    h.Delegation.GrantsValidFor().String(),
++			TokenTTL:    h.Delegation.TokensValidFor().String(),
++			PlanID:      plan.ID,
++		}
++		if err := h.Templates.Delegation(r, w, page); err != nil {
++			h.Logger.ErrorContext(ctx, "server template error", "err", err)
++		}
++	case http.MethodPost:
++		if r.FormValue("approval") != "approve" {
++			h.Logger.InfoContext(ctx, "authorization plan rejected by the user", "plan", plan.ID, "client_id", authReq.ClientID)
++			if err := h.Storage.DeleteAuthRequest(ctx, authReq.ID); err != nil && err != storage.ErrNotFound {
++				h.Logger.ErrorContext(ctx, "failed to delete auth request", "err", err)
++			}
++			u, err := url.Parse(authReq.RedirectURI)
++			if err != nil {
++				h.renderError(r, w, http.StatusBadRequest, "Approval rejected.")
++				return
++			}
++			q := u.Query()
++			q.Set("error", oauth2.AccessDenied)
++			q.Set("error_description", "The user rejected the operation.")
++			if authReq.State != "" {
++				q.Set("state", authReq.State)
++			}
++			u.RawQuery = q.Encode()
++			http.Redirect(w, r, u.String(), http.StatusSeeOther)
++			return
++		}
++		g, err := h.Delegation.Approve(ctx, h.Storage, &plan, authReq.Claims, now())
++		if err != nil {
++			h.Logger.ErrorContext(ctx, "failed to record operation grant", "plan", plan.ID, "err", err)
++			h.renderError(r, w, http.StatusInternalServerError, "Failed to record the approval.")
++			return
++		}
++		h.Logger.InfoContext(ctx, "operation grant approved", "plan", plan.ID, "delegate", plan.Delegate,
++			"operation", plan.Operation, "application", plan.Application.Name, "run", plan.Run.ID,
++			"expires_at", g.ExpiresAt.Format(time.RFC3339))
++		http.Redirect(w, r, h.buildApprovedURL(authReq), http.StatusSeeOther)
++	default:
++		h.renderError(r, w, http.StatusBadRequest, "Unsupported request method.")
++	}
++}
+diff --git a/server/delegation/canonical.go b/server/delegation/canonical.go
+new file mode 100644
+index 0000000..5fad134
+--- /dev/null
++++ b/server/delegation/canonical.go
+@@ -0,0 +1,171 @@
++package delegation
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/base64"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"sort"
++	"strconv"
++	"strings"
++)
++
++// Canonical JSON, PathOps v1: the byte form the TCP signs over and Dex,
++// the CLI and resource servers compare. It is RFC 8785 (JCS) restricted to a
++// subset where every encoder agrees byte for byte:
++//
++//   - objects (members sorted by key, no duplicate keys), arrays, strings,
++//     booleans and integers;
++//   - strings and keys of printable ASCII only (0x20-0x7E), escaping exactly
++//     '"' and '\';
++//   - integers within ±(2^53-1), written without sign for zero, exponent or
++//     fraction;
++//   - no null, no whitespace, at most maxDepth levels and maxCanonicalSize
++//     bytes.
++//
++// Input outside the subset is rejected, never normalized, so two parties can
++// only agree on bytes they both accepted.
++const (
++	maxCanonicalSize = 64 << 10
++	maxDepth         = 8
++)
++
++var errNotCanonical = errors.New("not PathOps canonical JSON")
++
++// Canonical returns the canonical form of raw (any JSON value).
++func Canonical(raw []byte) ([]byte, error) {
++	if len(raw) > maxCanonicalSize {
++		return nil, fmt.Errorf("%w: larger than %d bytes", errNotCanonical, maxCanonicalSize)
++	}
++	dec := json.NewDecoder(bytes.NewReader(raw))
++	dec.UseNumber()
++	var out bytes.Buffer
++	if err := canonicalValue(dec, &out, 0); err != nil {
++		return nil, err
++	}
++	if _, err := dec.Token(); err != io.EOF {
++		return nil, fmt.Errorf("%w: trailing data", errNotCanonical)
++	}
++	return out.Bytes(), nil
++}
++
++// DigestOf is the base64url (unpadded) SHA-256 of canonical bytes.
++func DigestOf(canonical []byte) string {
++	sum := sha256.Sum256(canonical)
++	return base64.RawURLEncoding.EncodeToString(sum[:])
++}
++
++func canonicalValue(dec *json.Decoder, out *bytes.Buffer, depth int) error {
++	if depth > maxDepth {
++		return fmt.Errorf("%w: nested deeper than %d", errNotCanonical, maxDepth)
++	}
++	tok, err := dec.Token()
++	if err != nil {
++		return fmt.Errorf("%w: %v", errNotCanonical, err)
++	}
++	switch v := tok.(type) {
++	case json.Delim:
++		switch v {
++		case '{':
++			return canonicalObject(dec, out, depth)
++		case '[':
++			out.WriteByte('[')
++			for i := 0; dec.More(); i++ {
++				if i > 0 {
++					out.WriteByte(',')
++				}
++				if err := canonicalValue(dec, out, depth+1); err != nil {
++					return err
++				}
++			}
++			if _, err := dec.Token(); err != nil {
++				return fmt.Errorf("%w: %v", errNotCanonical, err)
++			}
++			out.WriteByte(']')
++			return nil
++		}
++		return fmt.Errorf("%w: unexpected %q", errNotCanonical, v)
++	case string:
++		return writeString(out, v)
++	case bool:
++		out.WriteString(strconv.FormatBool(v))
++		return nil
++	case json.Number:
++		s := v.String()
++		if strings.ContainsAny(s, ".eE") || s == "-0" {
++			return fmt.Errorf("%w: number %s is not an integer", errNotCanonical, s)
++		}
++		n, err := strconv.ParseInt(s, 10, 64)
++		if err != nil || n > 1<<53-1 || n < -(1<<53-1) {
++			return fmt.Errorf("%w: integer %s out of range", errNotCanonical, s)
++		}
++		out.WriteString(strconv.FormatInt(n, 10))
++		return nil
++	case nil:
++		return fmt.Errorf("%w: null", errNotCanonical)
++	}
++	return fmt.Errorf("%w: unexpected token %v", errNotCanonical, tok)
++}
++
++func canonicalObject(dec *json.Decoder, out *bytes.Buffer, depth int) error {
++	members := map[string][]byte{}
++	for dec.More() {
++		tok, err := dec.Token()
++		if err != nil {
++			return fmt.Errorf("%w: %v", errNotCanonical, err)
++		}
++		key, ok := tok.(string)
++		if !ok {
++			return fmt.Errorf("%w: object key %v", errNotCanonical, tok)
++		}
++		if _, dup := members[key]; dup {
++			return fmt.Errorf("%w: duplicate key %q", errNotCanonical, key)
++		}
++		var v bytes.Buffer
++		if err := canonicalValue(dec, &v, depth+1); err != nil {
++			return err
++		}
++		members[key] = v.Bytes()
++	}
++	if _, err := dec.Token(); err != nil {
++		return fmt.Errorf("%w: %v", errNotCanonical, err)
++	}
++	keys := make([]string, 0, len(members))
++	for k := range members {
++		keys = append(keys, k)
++	}
++	sort.Strings(keys) // ASCII keys: byte order is UTF-16 code unit order (JCS)
++	out.WriteByte('{')
++	for i, k := range keys {
++		if i > 0 {
++			out.WriteByte(',')
++		}
++		if err := writeString(out, k); err != nil {
++			return err
++		}
++		out.WriteByte(':')
++		out.Write(members[k])
++	}
++	out.WriteByte('}')
++	return nil
++}
++
++func writeString(out *bytes.Buffer, s string) error {
++	for i := 0; i < len(s); i++ {
++		if c := s[i]; c < 0x20 || c > 0x7e {
++			return fmt.Errorf("%w: string %q is not printable ASCII", errNotCanonical, s)
++		}
++	}
++	out.WriteByte('"')
++	for i := 0; i < len(s); i++ {
++		if c := s[i]; c == '"' || c == '\\' {
++			out.WriteByte('\\')
++		}
++		out.WriteByte(s[i])
++	}
++	out.WriteByte('"')
++	return nil
++}
+diff --git a/server/delegation/delegation.go b/server/delegation/delegation.go
+new file mode 100644
+index 0000000..221d3d7
+--- /dev/null
++++ b/server/delegation/delegation.go
+@@ -0,0 +1,291 @@
++// Package delegation is the PathOps extension for operation-scoped human
++// delegated authorization (PathOps Decision 0050).
++//
++// A delegate is a confidential client (the PathOps Tenant Control Plane) that
++// computes, for one user operation, an Authorization Plan: the exact RAR
++// (RFC 9396) authorization_details the operation needs, bound to the user,
++// the operation and its Application/Run, the public OAuth client that will
++// carry it, its redirect URI and PKCE challenge. The delegate signs the plan
++// with an Ed25519 key registered here. The public client pushes the plan and
++// the same authorization_details to Dex with a standard Pushed Authorization
++// Request (RFC 9126) and continues with Authorization Code + PKCE:
++//
++//	CLI --PAR(authorization_details, signed plan, PKCE challenge)--> Dex
++//	Dex --request_uri--> CLI --> browser --> login --> per-operation consent
++//	CLI --code + PKCE verifier--> Dex: the operation grant becomes active
++//	delegate --client auth + operation grant + detail subset--> Dex
++//	Dex --short-lived token: aud=<tool audience>, exact details--> delegate
++//
++// Dex accepts a plan only when its signature verifies with a key of its
++// issuer, and the pushed authorization_details are exactly (canonical JSON)
++// the plan's. The consent screen shows the plan. Approval records an operation
++// grant for the user; redeeming the authorization code with the plan's PKCE
++// verifier activates it. Only the plan's delegate, authenticated as a
++// confidential client, can then derive tool tokens from it: one audience, a
++// subset of the approved details, a short lifetime and no refresh token. The
++// user's own access tokens never take part in the derivation.
++//
++// Grants live in the user's storage.UserIdentity (Consents map, reserved key
++// prefix), so no storage schema changes; the in-flight plan rides on the
++// AuthRequest/AuthCode Delegation field. Delegation requires a storage that
++// keeps that field (kubernetes, memory).
++package delegation
++
++import (
++	"crypto/ed25519"
++	"encoding/base64"
++	"errors"
++	"fmt"
++	"regexp"
++	"slices"
++	"time"
++)
++
++// Wire names.
++const (
++	// PlanParam carries the signed plan in the pushed authorization request.
++	PlanParam = "pathops_authorization_plan"
++	// DetailsParam is the RFC 9396 parameter.
++	DetailsParam = "authorization_details"
++	// RequestURIPrefix prefixes every request_uri (RFC 9126 §2.2).
++	RequestURIPrefix = "urn:ietf:params:oauth:request_uri:"
++	// OperationGrantTokenType is the RFC 8693 subject_token_type of an
++	// operation grant handle.
++	OperationGrantTokenType = "urn:pathops:params:oauth:token-type:operation-grant"
++	// PlanTokenType is the JWS "typ" of a signed plan.
++	PlanTokenType = "pathops-authorization-plan+jwt"
++	// PlanVersion is the plan schema this Dex accepts.
++	PlanVersion = 1
++)
++
++// Config is the "delegation" section of the Dex configuration.
++type Config struct {
++	// PlanClients are the public OAuth clients that may push plans (PAR).
++	PlanClients []string `json:"planClients"`
++	// PushedRequestsValidFor bounds a request_uri (default 90s).
++	PushedRequestsValidFor string `json:"pushedRequestsValidFor"`
++	// MaxPlanLifetime bounds exp-iat of a plan (default 15m).
++	MaxPlanLifetime string `json:"maxPlanLifetime"`
++	// GrantsValidFor is an operation grant's lifetime from approval (default 15m).
++	GrantsValidFor string `json:"grantsValidFor"`
++	// TokensValidFor bounds a derived tool token (default 5m).
++	TokensValidFor string `json:"tokensValidFor"`
++	// Delegates are the confidential clients that sign plans and derive tool
++	// tokens from the resulting grants.
++	Delegates []DelegateConfig `json:"delegates"`
++}
++
++// DelegateConfig is one delegate.
++type DelegateConfig struct {
++	// Client is the delegate's (confidential) static client id.
++	Client string `json:"client"`
++	// Name is shown on the consent screen.
++	Name string `json:"name"`
++	// PlanIssuer is the "iss" of the delegate's plans.
++	PlanIssuer string `json:"planIssuer"`
++	// PlanKeys verify the delegate's plans.
++	PlanKeys []KeyConfig `json:"planKeys"`
++	// Tools are the audiences the delegate may derive tokens for.
++	Tools []ToolConfig `json:"tools"`
++}
++
++// KeyConfig is an Ed25519 plan-signing public key.
++type KeyConfig struct {
++	KeyID string `json:"kid"`
++	// Ed25519 is the raw 32-byte public key, base64url (a JWK OKP "x").
++	Ed25519 string `json:"ed25519"`
++}
++
++// ToolConfig is a resource server the delegate may derive tokens for.
++type ToolConfig struct {
++	// Name is the "tool" of its authorization details (e.g. forgejo).
++	Name string `json:"name"`
++	// DisplayName is shown on the consent screen (default Name).
++	DisplayName string `json:"displayName"`
++	// AudiencePattern is a regular expression a plan's audience for this tool
++	// must match entirely.
++	AudiencePattern string `json:"audiencePattern"`
++	// DetailTypes are the authorization detail types of this tool.
++	DetailTypes []string `json:"detailTypes"`
++}
++
++// Policy is the validated configuration.
++type Policy struct {
++	planClients     map[string]bool
++	pushedTTL       time.Duration
++	maxPlanLifetime time.Duration
++	grantTTL        time.Duration
++	tokenTTL        time.Duration
++	delegates       map[string]*delegate // by client id
++	byIssuer        map[string]*delegate // by plan issuer
++}
++
++type delegate struct {
++	client, name, issuer string
++	keys                 map[string]ed25519.PublicKey
++	tools                map[string]*tool
++}
++
++type tool struct {
++	name, display string
++	audience      *regexp.Regexp
++	types         map[string]bool
++}
++
++var identifier = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
++
++// NewPolicy validates c.
++func NewPolicy(c Config) (*Policy, error) {
++	p := &Policy{
++		planClients: map[string]bool{},
++		delegates:   map[string]*delegate{},
++		byIssuer:    map[string]*delegate{},
++	}
++	var err error
++	durations := []struct {
++		name  string
++		value string
++		def   time.Duration
++		max   time.Duration
++		into  *time.Duration
++	}{
++		{"pushedRequestsValidFor", c.PushedRequestsValidFor, 90 * time.Second, 10 * time.Minute, &p.pushedTTL},
++		{"maxPlanLifetime", c.MaxPlanLifetime, 15 * time.Minute, time.Hour, &p.maxPlanLifetime},
++		{"grantsValidFor", c.GrantsValidFor, 15 * time.Minute, 24 * time.Hour, &p.grantTTL},
++		{"tokensValidFor", c.TokensValidFor, 5 * time.Minute, 15 * time.Minute, &p.tokenTTL},
++	}
++	for _, d := range durations {
++		*d.into = d.def
++		if d.value != "" {
++			if *d.into, err = time.ParseDuration(d.value); err != nil {
++				return nil, fmt.Errorf("delegation.%s: %v", d.name, err)
++			}
++		}
++		if *d.into <= 0 || *d.into > d.max {
++			return nil, fmt.Errorf("delegation.%s must be positive and at most %s", d.name, d.max)
++		}
++	}
++	if p.tokenTTL > p.grantTTL {
++		return nil, errors.New("delegation.tokensValidFor must not exceed grantsValidFor")
++	}
++	if len(c.PlanClients) == 0 {
++		return nil, errors.New("delegation.planClients is empty")
++	}
++	for _, id := range c.PlanClients {
++		if !identifier.MatchString(id) {
++			return nil, fmt.Errorf("delegation.planClients: %q is not a client id", id)
++		}
++		p.planClients[id] = true
++	}
++	if len(c.Delegates) == 0 {
++		return nil, errors.New("delegation.delegates is empty")
++	}
++	for _, dc := range c.Delegates {
++		d, err := newDelegate(dc)
++		if err != nil {
++			return nil, err
++		}
++		if p.planClients[d.client] {
++			return nil, fmt.Errorf("delegation: %q cannot be both a plan client and a delegate", d.client)
++		}
++		if p.delegates[d.client] != nil || p.byIssuer[d.issuer] != nil {
++			return nil, fmt.Errorf("delegation: delegate %q or plan issuer %q is configured twice", d.client, d.issuer)
++		}
++		p.delegates[d.client] = d
++		p.byIssuer[d.issuer] = d
++	}
++	return p, nil
++}
++
++func newDelegate(c DelegateConfig) (*delegate, error) {
++	if !identifier.MatchString(c.Client) {
++		return nil, fmt.Errorf("delegation.delegates: %q is not a client id", c.Client)
++	}
++	d := &delegate{client: c.Client, name: c.Name, issuer: c.PlanIssuer,
++		keys: map[string]ed25519.PublicKey{}, tools: map[string]*tool{}}
++	if d.name == "" {
++		d.name = c.Client
++	}
++	if d.issuer == "" {
++		return nil, fmt.Errorf("delegation.delegates[%s].planIssuer is empty", c.Client)
++	}
++	if len(c.PlanKeys) == 0 {
++		return nil, fmt.Errorf("delegation.delegates[%s].planKeys is empty", c.Client)
++	}
++	for _, k := range c.PlanKeys {
++		raw, err := base64.RawURLEncoding.DecodeString(k.Ed25519)
++		if !identifier.MatchString(k.KeyID) || err != nil || len(raw) != ed25519.PublicKeySize {
++			return nil, fmt.Errorf("delegation.delegates[%s].planKeys: kid %q needs a base64url 32-byte Ed25519 key", c.Client, k.KeyID)
++		}
++		if _, dup := d.keys[k.KeyID]; dup {
++			return nil, fmt.Errorf("delegation.delegates[%s].planKeys: kid %q twice", c.Client, k.KeyID)
++		}
++		d.keys[k.KeyID] = ed25519.PublicKey(raw)
++	}
++	if len(c.Tools) == 0 {
++		return nil, fmt.Errorf("delegation.delegates[%s].tools is empty", c.Client)
++	}
++	for _, tc := range c.Tools {
++		if !identifier.MatchString(tc.Name) || d.tools[tc.Name] != nil {
++			return nil, fmt.Errorf("delegation.delegates[%s].tools: invalid or repeated name %q", c.Client, tc.Name)
++		}
++		re, err := regexp.Compile(`^(?:` + tc.AudiencePattern + `)$`)
++		if tc.AudiencePattern == "" || err != nil {
++			return nil, fmt.Errorf("delegation.delegates[%s].tools[%s].audiencePattern: %v", c.Client, tc.Name, err)
++		}
++		t := &tool{name: tc.Name, display: tc.DisplayName, audience: re, types: map[string]bool{}}
++		if t.display == "" {
++			t.display = tc.Name
++		}
++		if len(tc.DetailTypes) == 0 {
++			return nil, fmt.Errorf("delegation.delegates[%s].tools[%s].detailTypes is empty", c.Client, tc.Name)
++		}
++		for _, typ := range tc.DetailTypes {
++			if !identifier.MatchString(typ) {
++				return nil, fmt.Errorf("delegation.delegates[%s].tools[%s]: %q is not a detail type", c.Client, tc.Name, typ)
++			}
++			t.types[typ] = true
++		}
++		d.tools[tc.Name] = t
++	}
++	return d, nil
++}
++
++// PlanClient reports whether clientID may push plans.
++func (p *Policy) PlanClient(clientID string) bool { return p.planClients[clientID] }
++
++// Delegate reports whether clientID is a delegate.
++func (p *Policy) Delegate(clientID string) bool { return p.delegates[clientID] != nil }
++
++// PushedRequestsValidFor is the lifetime of a request_uri.
++func (p *Policy) PushedRequestsValidFor() time.Duration { return p.pushedTTL }
++
++// DetailTypes are every configured authorization detail type (discovery).
++func (p *Policy) DetailTypes() []string {
++	var out []string
++	for _, d := range p.delegates {
++		for _, t := range d.tools {
++			for typ := range t.types {
++				if !slices.Contains(out, typ) {
++					out = append(out, typ)
++				}
++			}
++		}
++	}
++	slices.Sort(out)
++	return out
++}
++
++// DelegateName is the consent-screen name of a delegate.
++func (p *Policy) DelegateName(clientID string) string {
++	if d := p.delegates[clientID]; d != nil {
++		return d.name
++	}
++	return clientID
++}
++
++// GrantsValidFor is an operation grant's lifetime from approval.
++func (p *Policy) GrantsValidFor() time.Duration { return p.grantTTL }
++
++// TokensValidFor bounds a derived tool token.
++func (p *Policy) TokensValidFor() time.Duration { return p.tokenTTL }
+diff --git a/server/delegation/delegation_test.go b/server/delegation/delegation_test.go
+new file mode 100644
+index 0000000..3fdb2a4
+--- /dev/null
++++ b/server/delegation/delegation_test.go
+@@ -0,0 +1,60 @@
++package delegation
++
++import (
++	"encoding/base64"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func validConfig() Config {
++	return Config{
++		PlanClients: []string{"pathops-cli"},
++		Delegates: []DelegateConfig{{
++			Client: "pathops-tenant-control-plane", PlanIssuer: "https://tcp.example",
++			PlanKeys: []KeyConfig{{KeyID: "k1", Ed25519: base64.RawURLEncoding.EncodeToString(make([]byte, 32))}},
++			Tools:    []ToolConfig{{Name: "forgejo", AudiencePattern: `u:[0-9]+:[0-9a-f-]{36}`, DetailTypes: []string{"pathops_repository"}}},
++		}},
++	}
++}
++
++func TestNewPolicy(t *testing.T) {
++	p, err := NewPolicy(validConfig())
++	require.NoError(t, err)
++	require.Equal(t, "15m0s", p.GrantsValidFor().String())
++	require.Equal(t, "5m0s", p.TokensValidFor().String())
++	require.True(t, p.PlanClient("pathops-cli"))
++	require.True(t, p.Delegate("pathops-tenant-control-plane"))
++	require.False(t, p.Delegate("pathops-cli"))
++
++	for name, mod := range map[string]func(*Config){
++		"no plan clients":         func(c *Config) { c.PlanClients = nil },
++		"no delegates":            func(c *Config) { c.Delegates = nil },
++		"delegate is plan client": func(c *Config) { c.PlanClients = []string{"pathops-tenant-control-plane"} },
++		"short key":               func(c *Config) { c.Delegates[0].PlanKeys[0].Ed25519 = "AAAA" },
++		"no issuer":               func(c *Config) { c.Delegates[0].PlanIssuer = "" },
++		"no tools":                func(c *Config) { c.Delegates[0].Tools = nil },
++		"no audience pattern":     func(c *Config) { c.Delegates[0].Tools[0].AudiencePattern = "" },
++		"no detail types":         func(c *Config) { c.Delegates[0].Tools[0].DetailTypes = nil },
++		"token outlives grant":    func(c *Config) { c.GrantsValidFor, c.TokensValidFor = "1m", "5m" },
++		"grant over a day":        func(c *Config) { c.GrantsValidFor = "48h" },
++		"bad duration":            func(c *Config) { c.TokensValidFor = "soon" },
++	} {
++		t.Run(name, func(t *testing.T) {
++			c := validConfig()
++			mod(&c)
++			_, err := NewPolicy(c)
++			require.Error(t, err)
++		})
++	}
++}
++
++func TestAudiencePatternIsAnchored(t *testing.T) {
++	p, err := NewPolicy(validConfig())
++	require.NoError(t, err)
++	re := p.delegates["pathops-tenant-control-plane"].tools["forgejo"].audience
++	require.True(t, re.MatchString("u:7:2f0c6a51-8d7e-4b8e-9c55-3a2f0e9b1c44"))
++	require.False(t, re.MatchString("x u:7:2f0c6a51-8d7e-4b8e-9c55-3a2f0e9b1c44"))
++	require.False(t, re.MatchString("u:7:2f0c6a51-8d7e-4b8e-9c55-3a2f0e9b1c44"+strings.Repeat("0", 1)))
++}
+diff --git a/server/delegation/derive.go b/server/delegation/derive.go
+new file mode 100644
+index 0000000..aab48ea
+--- /dev/null
++++ b/server/delegation/derive.go
+@@ -0,0 +1,84 @@
++package delegation
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"time"
++
++	"github.com/dexidp/dex/server/signer"
++	"github.com/dexidp/dex/storage"
++)
++
++// Derived is a tool token derived from an operation grant.
++type Derived struct {
++	Token    string
++	Expiry   time.Time
++	Audience string
++	// Details are the token's authorization_details (canonical).
++	Details json.RawMessage
++}
++
++// DeriveError is a derivation the delegate is refused; Type is the OAuth2
++// error code (invalid_grant, invalid_target, invalid_authorization_details).
++type DeriveError struct {
++	Type        string
++	Description string
++}
++
++func (e *DeriveError) Error() string { return e.Type + ": " + e.Description }
++
++// Derive mints, for the authenticated delegate, a token for one tool audience
++// carrying a subset of an active operation grant's details. The token lives
++// at most tokensValidFor and never beyond the grant; there is no refresh
++// token. Nothing of the user's own tokens is involved: the grant handle names
++// a grant the user approved and completed.
++func (p *Policy) Derive(ctx context.Context, s storage.Storage, sig signer.Signer, issuer, delegateID, handle, audience, details string,
++	now time.Time) (*Derived, error) {
++	if p.delegates[delegateID] == nil {
++		return nil, &DeriveError{Type: "unauthorized_client", Description: "the client is not a delegate"}
++	}
++	g, err := p.load(ctx, s, handle, delegateID, now)
++	switch {
++	case errors.Is(err, ErrGrantNotFound), errors.Is(err, ErrGrantInactive), errors.Is(err, ErrGrantExpired):
++		return nil, &DeriveError{Type: "invalid_grant", Description: err.Error()}
++	case err != nil:
++		return nil, err
++	}
++	sub, toolName, err := subset(g.Plan.Details, details)
++	if err != nil {
++		return nil, &DeriveError{Type: "invalid_authorization_details", Description: err.Error()}
++	}
++	if want := g.Plan.Audiences[toolName]; audience == "" || audience != want {
++		return nil, &DeriveError{Type: "invalid_target", Description: fmt.Sprintf("audience is not the grant's %s audience", toolName)}
++	}
++	exp := now.Add(p.tokenTTL)
++	if g.ExpiresAt.Before(exp) {
++		exp = g.ExpiresAt
++	}
++	claims := struct {
++		Issuer      string          `json:"iss"`
++		Subject     string          `json:"sub"`
++		Audience    string          `json:"aud"`
++		AZP         string          `json:"azp"`
++		IssuedAt    int64           `json:"iat"`
++		Expiry      int64           `json:"exp"`
++		ID          string          `json:"jti"`
++		Details     json.RawMessage `json:"authorization_details"`
++		Grant       string          `json:"pathops_grant"`
++		Operation   string          `json:"pathops_operation"`
++		Application string          `json:"pathops_application"`
++		Run         string          `json:"pathops_run"`
++	}{issuer, g.Plan.Subject, audience, delegateID, now.Unix(), exp.Unix(), storage.NewID(), sub,
++		g.Plan.ID, g.Plan.Operation, g.Plan.Application.ID, g.Plan.Run.ID}
++	payload, err := json.Marshal(claims)
++	if err != nil {
++		return nil, err
++	}
++	tok, err := sig.Sign(ctx, payload)
++	if err != nil {
++		return nil, fmt.Errorf("signing a delegated token: %w", err)
++	}
++	return &Derived{Token: tok, Expiry: exp, Audience: audience, Details: sub}, nil
++}
+diff --git a/server/delegation/flow.go b/server/delegation/flow.go
+new file mode 100644
+index 0000000..d7ba6e0
+--- /dev/null
++++ b/server/delegation/flow.go
+@@ -0,0 +1,40 @@
++package delegation
++
++import (
++	"errors"
++	"time"
++
++	"github.com/dexidp/dex/server/internal"
++	"github.com/dexidp/dex/storage"
++)
++
++// Errors of an authorization request carrying a plan. Their text is shown to
++// the user.
++var (
++	ErrNotAFlow    = errors.New("this authorization request cannot be used directly; start the operation again")
++	ErrWrongUser   = errors.New("this authorization was prepared for another user; sign in as the user who started the operation")
++	ErrPlanExpired = errors.New("this authorization plan expired; start the operation again")
++)
++
++// CheckAuthRequest returns the delegation state of a logged-in authorization
++// request after checking it may continue: it is a flow (not the stored pushed
++// request, and its request_uri was consumed), the authenticated user is the
++// plan's subject, and the plan has not expired. It returns nil, nil for a
++// request without delegation.
++func CheckAuthRequest(authReq storage.AuthRequest, now time.Time) (*Request, error) {
++	d, err := DecodeRequest(authReq.Delegation)
++	if err != nil || d == nil {
++		return nil, err
++	}
++	if d.Pushed || d.PushedID != "" {
++		return nil, ErrNotAFlow
++	}
++	sub, err := internal.Marshal(&internal.IDTokenSubject{UserId: authReq.Claims.UserID, ConnId: authReq.ConnectorID})
++	if err != nil || !authReq.LoggedIn || sub != d.Plan.Subject {
++		return nil, ErrWrongUser
++	}
++	if !now.Before(d.Plan.Expiry) {
++		return nil, ErrPlanExpired
++	}
++	return d, nil
++}
+diff --git a/server/delegation/grant.go b/server/delegation/grant.go
+new file mode 100644
+index 0000000..850437b
+--- /dev/null
++++ b/server/delegation/grant.go
+@@ -0,0 +1,223 @@
++package delegation
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"strings"
++	"time"
++
++	"github.com/dexidp/dex/storage"
++)
++
++// Request is the delegation state of an AuthRequest and of the AuthCode
++// issued from it (their Delegation field).
++type Request struct {
++	// Pushed marks the stored pushed request: it is only a template for the
++	// authorization request its request_uri starts, never a flow of its own.
++	Pushed bool `json:"pushed,omitempty"`
++	// PushedID is the pushed request an authorization request was started
++	// from; it is consumed (deleted) when that request is created.
++	PushedID string `json:"pushedId,omitempty"`
++	Plan     Plan   `json:"plan"`
++}
++
++// Encode is r as stored.
++func (r *Request) Encode() []byte {
++	b, err := json.Marshal(r)
++	if err != nil {
++		panic(err) // a Request always marshals
++	}
++	return b
++}
++
++// DecodeRequest reads a stored Delegation field (nil, nil when empty).
++func DecodeRequest(b []byte) (*Request, error) {
++	if len(b) == 0 {
++		return nil, nil
++	}
++	var r Request
++	if err := json.Unmarshal(b, &r); err != nil {
++		return nil, fmt.Errorf("delegation state: %v", err)
++	}
++	return &r, nil
++}
++
++// Grant status.
++const (
++	// GrantApproved: the user approved the plan; not usable until the
++	// authorization code is redeemed with the plan's PKCE verifier.
++	GrantApproved = "approved"
++	// GrantActive: approved and completed by the plan's client.
++	GrantActive = "active"
++)
++
++// Grant is an operation grant: one approved plan of one user.
++type Grant struct {
++	Version     int       `json:"v"`
++	Status      string    `json:"status"`
++	Plan        Plan      `json:"plan"`
++	ApprovedAt  time.Time `json:"approvedAt"`
++	ActivatedAt time.Time `json:"activatedAt,omitzero"`
++	ExpiresAt   time.Time `json:"expiresAt"`
++}
++
++// grantKeyPrefix marks grants in UserIdentity.Consents (whose other keys are
++// client ids).
++const grantKeyPrefix = "pathops.io/operation-grant/"
++
++// Errors of loading a grant for a derivation. Their text is returned to the
++// delegate.
++var (
++	ErrGrantNotFound = errors.New("operation grant not found")
++	ErrGrantInactive = errors.New("operation grant not completed (authorization code not redeemed)")
++	ErrGrantExpired  = errors.New("operation grant expired")
++)
++
++// Handle is the operation grant handle a delegate presents: it identifies
++// the grant (plan id) and its user (subject). It is not a credential: only the
++// plan's delegate, authenticated, can use it.
++func Handle(planID, subject string) string { return "pog1:" + planID + ":" + subject }
++
++func parseHandle(h string) (planID, subject string, ok bool) {
++	parts := strings.Split(h, ":")
++	if len(parts) != 3 || parts[0] != "pog1" || parts[1] == "" || parts[2] == "" {
++		return "", "", false
++	}
++	return parts[1], parts[2], true
++}
++
++func decodeGrant(values []string) (*Grant, error) {
++	if len(values) != 1 {
++		return nil, errors.New("malformed operation grant")
++	}
++	var g Grant
++	if err := json.Unmarshal([]byte(values[0]), &g); err != nil || g.Version != 1 {
++		return nil, errors.New("malformed operation grant")
++	}
++	return &g, nil
++}
++
++func encodeGrant(g *Grant) []string {
++	b, err := json.Marshal(g)
++	if err != nil {
++		panic(err) // a Grant always marshals
++	}
++	return []string{string(b)}
++}
++
++// updateIdentity applies fn to the user's identity, creating it when absent.
++func updateIdentity(ctx context.Context, s storage.Storage, userID, connID string, claims storage.Claims, now time.Time,
++	fn func(map[string][]string) error) error {
++	update := func() error {
++		return s.UpdateUserIdentity(ctx, userID, connID, func(old storage.UserIdentity) (storage.UserIdentity, error) {
++			if old.Consents == nil {
++				old.Consents = map[string][]string{}
++			}
++			if err := fn(old.Consents); err != nil {
++				return old, err
++			}
++			return old, nil
++		})
++	}
++	err := update()
++	if !errors.Is(err, storage.ErrNotFound) {
++		return err
++	}
++	consents := map[string][]string{}
++	if err := fn(consents); err != nil {
++		return err
++	}
++	err = s.CreateUserIdentity(ctx, storage.UserIdentity{UserID: userID, ConnectorID: connID, Claims: claims,
++		Consents: consents, CreatedAt: now, LastLogin: now})
++	if errors.Is(err, storage.ErrAlreadyExists) {
++		return update()
++	}
++	return err
++}
++
++// pruneAfter: expired grants are kept this long (for inspection), then
++// dropped on the next write of the user's identity.
++const pruneAfter = 24 * time.Hour
++
++func prune(consents map[string][]string, now time.Time) {
++	for k, v := range consents {
++		if !strings.HasPrefix(k, grantKeyPrefix) {
++			continue
++		}
++		if g, err := decodeGrant(v); err != nil || now.After(g.ExpiresAt.Add(pruneAfter)) {
++			delete(consents, k)
++		}
++	}
++}
++
++// Approve records the user's approval of plan (status approved). Approving
++// the same plan again replaces the grant.
++func (p *Policy) Approve(ctx context.Context, s storage.Storage, plan *Plan, claims storage.Claims, now time.Time) (*Grant, error) {
++	userID, connID := plan.UserID()
++	if userID == "" {
++		return nil, errors.New("plan subject cannot be decoded")
++	}
++	g := &Grant{Version: 1, Status: GrantApproved, Plan: *plan, ApprovedAt: now, ExpiresAt: now.Add(p.grantTTL)}
++	err := updateIdentity(ctx, s, userID, connID, claims, now, func(c map[string][]string) error {
++		prune(c, now)
++		c[grantKeyPrefix+plan.ID] = encodeGrant(g)
++		return nil
++	})
++	return g, err
++}
++
++// Activate completes the approved grant of plan: its authorization code was
++// redeemed with the plan's PKCE verifier.
++func (p *Policy) Activate(ctx context.Context, s storage.Storage, plan *Plan, now time.Time) (*Grant, error) {
++	userID, connID := plan.UserID()
++	var out *Grant
++	err := s.UpdateUserIdentity(ctx, userID, connID, func(old storage.UserIdentity) (storage.UserIdentity, error) {
++		g, err := decodeGrant(old.Consents[grantKeyPrefix+plan.ID])
++		if err != nil {
++			return old, ErrGrantNotFound
++		}
++		if g.Plan.DetailsSHA256 != plan.DetailsSHA256 || g.Plan.Subject != plan.Subject {
++			return old, errors.New("the operation grant changed since this authorization code was issued")
++		}
++		if !now.Before(g.ExpiresAt) {
++			return old, ErrGrantExpired
++		}
++		g.Status, g.ActivatedAt = GrantActive, now
++		old.Consents[grantKeyPrefix+plan.ID] = encodeGrant(g)
++		out = g
++		return old, nil
++	})
++	return out, err
++}
++
++// load returns the usable grant of a handle for delegate at now.
++func (p *Policy) load(ctx context.Context, s storage.Storage, handle, delegateID string, now time.Time) (*Grant, error) {
++	planID, subject, ok := parseHandle(handle)
++	if !ok {
++		return nil, ErrGrantNotFound
++	}
++	pl := Plan{Subject: subject}
++	userID, connID := pl.UserID()
++	if userID == "" {
++		return nil, ErrGrantNotFound
++	}
++	ui, err := s.GetUserIdentity(ctx, userID, connID)
++	if errors.Is(err, storage.ErrNotFound) {
++		return nil, ErrGrantNotFound
++	}
++	if err != nil {
++		return nil, err
++	}
++	g, err := decodeGrant(ui.Consents[grantKeyPrefix+planID])
++	switch {
++	case err != nil, g.Plan.ID != planID, g.Plan.Subject != subject, g.Plan.Delegate != delegateID:
++		return nil, ErrGrantNotFound
++	case !now.Before(g.ExpiresAt):
++		return nil, ErrGrantExpired
++	case g.Status != GrantActive:
++		return nil, ErrGrantInactive
++	}
++	return g, nil
++}
+diff --git a/server/delegation/plan.go b/server/delegation/plan.go
+new file mode 100644
+index 0000000..b545267
+--- /dev/null
++++ b/server/delegation/plan.go
+@@ -0,0 +1,398 @@
++package delegation
++
++import (
++	"bytes"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"regexp"
++	"slices"
++	"strings"
++	"time"
++
++	jose "github.com/go-jose/go-jose/v4"
++
++	"github.com/dexidp/dex/server/internal"
++)
++
++// Plan is a verified Authorization Plan.
++type Plan struct {
++	ID       string    `json:"id"`
++	Issuer   string    `json:"iss"`
++	Delegate string    `json:"delegate"`
++	Subject  string    `json:"sub"`
++	IssuedAt time.Time `json:"iat"`
++	Expiry   time.Time `json:"exp"`
++
++	Installation string      `json:"installation"`
++	Operation    string      `json:"operation"`
++	Application  Application `json:"application"`
++	Run          Run         `json:"run"`
++	Template     Template    `json:"template"`
++
++	ClientID            string `json:"client_id"`
++	RedirectURI         string `json:"redirect_uri"`
++	CodeChallenge       string `json:"code_challenge"`
++	CodeChallengeMethod string `json:"code_challenge_method"`
++
++	// Audiences maps each tool of the details to its token audience.
++	Audiences map[string]string `json:"audiences"`
++	// Details is the canonical JSON array of authorization_details.
++	Details       json.RawMessage `json:"authorization_details"`
++	DetailsSHA256 string          `json:"authorization_details_sha256"`
++}
++
++// Application names the plan's Application.
++type Application struct {
++	ID   string `json:"id"`
++	Name string `json:"name"`
++}
++
++// Run names the plan's durable Run.
++type Run struct {
++	ID string `json:"id"`
++}
++
++// Template is the template provenance of the operation.
++type Template struct {
++	ID       string `json:"id"`
++	Source   string `json:"source"`
++	Ref      string `json:"ref"`
++	Revision string `json:"revision,omitempty"`
++}
++
++// planClaims is the plan's JWS payload, decoded strictly.
++type planClaims struct {
++	Issuer   string          `json:"iss"`
++	Audience string          `json:"aud"`
++	Subject  string          `json:"sub"`
++	ID       string          `json:"jti"`
++	IssuedAt int64           `json:"iat"`
++	Expiry   int64           `json:"exp"`
++	Plan     planBody        `json:"pathops_plan"`
++	Details  json.RawMessage `json:"authorization_details"`
++}
++
++type planBody struct {
++	Version             int               `json:"version"`
++	Installation        string            `json:"installation"`
++	Operation           string            `json:"operation"`
++	Application         Application       `json:"application"`
++	Run                 Run               `json:"run"`
++	Template            Template          `json:"template"`
++	ClientID            string            `json:"client_id"`
++	RedirectURI         string            `json:"redirect_uri"`
++	CodeChallenge       string            `json:"code_challenge"`
++	CodeChallengeMethod string            `json:"code_challenge_method"`
++	Audiences           map[string]string `json:"audiences"`
++	DetailsSHA256       string            `json:"authorization_details_sha256"`
++}
++
++// ErrInvalidPlan: the plan is not acceptable. Its message is safe to return
++// to the client.
++var ErrInvalidPlan = errors.New("invalid authorization plan")
++
++func invalid(format string, a ...any) error {
++	return fmt.Errorf("%w: %s", ErrInvalidPlan, fmt.Sprintf(format, a...))
++}
++
++var (
++	planID      = regexp.MustCompile(`^[A-Za-z0-9-]{8,64}$`)
++	operation   = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
++	challenge   = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
++	maxPlanSize = 96 << 10
++	clockSkew   = time.Minute
++)
++
++// VerifyPlan verifies a signed plan for this Dex (issuer) at now.
++func (p *Policy) VerifyPlan(raw, issuer string, now time.Time) (*Plan, error) {
++	if raw == "" || len(raw) > maxPlanSize {
++		return nil, invalid("missing or too large")
++	}
++	jws, err := jose.ParseSigned(raw, []jose.SignatureAlgorithm{jose.EdDSA})
++	if err != nil {
++		return nil, invalid("not an EdDSA JWS")
++	}
++	if len(jws.Signatures) != 1 {
++		return nil, invalid("exactly one signature is required")
++	}
++	h := jws.Signatures[0].Protected
++	if typ, _ := h.ExtraHeaders[jose.HeaderType].(string); typ != PlanTokenType {
++		return nil, invalid("typ must be %s", PlanTokenType)
++	}
++	var unverified struct {
++		Issuer string `json:"iss"`
++	}
++	if err := json.Unmarshal(jws.UnsafePayloadWithoutVerification(), &unverified); err != nil {
++		return nil, invalid("payload is not JSON")
++	}
++	d := p.byIssuer[unverified.Issuer]
++	if d == nil {
++		return nil, invalid("untrusted plan issuer")
++	}
++	key, ok := d.keys[h.KeyID]
++	if !ok {
++		return nil, invalid("unknown plan key")
++	}
++	payload, err := jws.Verify(key)
++	if err != nil {
++		return nil, invalid("bad signature")
++	}
++	var c planClaims
++	dec := json.NewDecoder(bytes.NewReader(payload))
++	dec.DisallowUnknownFields()
++	if err := dec.Decode(&c); err != nil || dec.More() {
++		return nil, invalid("unexpected claims")
++	}
++	iat, exp := time.Unix(c.IssuedAt, 0), time.Unix(c.Expiry, 0)
++	switch {
++	case c.Issuer != d.issuer:
++		return nil, invalid("issuer changed")
++	case c.Audience != issuer:
++		return nil, invalid("audience is not this issuer")
++	case c.IssuedAt == 0 || c.Expiry == 0 || !exp.After(iat) || exp.Sub(iat) > p.maxPlanLifetime:
++		return nil, invalid("iat/exp missing or lifetime above %s", p.maxPlanLifetime)
++	case iat.After(now.Add(clockSkew)):
++		return nil, invalid("issued in the future")
++	case !now.Before(exp):
++		return nil, invalid("expired")
++	case !planID.MatchString(c.ID):
++		return nil, invalid("jti")
++	case c.Plan.Version != PlanVersion:
++		return nil, invalid("unsupported version %d", c.Plan.Version)
++	case !identifier.MatchString(c.Plan.Installation) || !operation.MatchString(c.Plan.Operation):
++		return nil, invalid("installation or operation")
++	case !planID.MatchString(c.Plan.Application.ID) || !identifier.MatchString(c.Plan.Application.Name) || !planID.MatchString(c.Plan.Run.ID):
++		return nil, invalid("application or run")
++	case c.Plan.Template.ID == "" || c.Plan.Template.Source == "" || c.Plan.Template.Ref == "":
++		return nil, invalid("template provenance")
++	case !p.planClients[c.Plan.ClientID]:
++		return nil, invalid("client_id may not carry plans")
++	case c.Plan.RedirectURI == "":
++		return nil, invalid("redirect_uri")
++	case c.Plan.CodeChallengeMethod != "S256" || !challenge.MatchString(c.Plan.CodeChallenge):
++		return nil, invalid("an S256 code_challenge is required")
++	}
++	var sub internal.IDTokenSubject
++	if err := internal.Unmarshal(c.Subject, &sub); err != nil || sub.UserId == "" || sub.ConnId == "" {
++		return nil, invalid("sub is not a subject of this issuer")
++	}
++	details, err := Canonical(c.Details)
++	if err != nil {
++		return nil, invalid("authorization_details: %v", err)
++	}
++	if DigestOf(details) != c.Plan.DetailsSHA256 {
++		return nil, invalid("authorization_details_sha256 does not match")
++	}
++	if err := d.checkDetails(details, c.Plan.Audiences); err != nil {
++		return nil, err
++	}
++	return &Plan{
++		ID: c.ID, Issuer: c.Issuer, Delegate: d.client, Subject: c.Subject, IssuedAt: iat, Expiry: exp,
++		Installation: c.Plan.Installation, Operation: c.Plan.Operation, Application: c.Plan.Application,
++		Run: c.Plan.Run, Template: c.Plan.Template, ClientID: c.Plan.ClientID, RedirectURI: c.Plan.RedirectURI,
++		CodeChallenge: c.Plan.CodeChallenge, CodeChallengeMethod: c.Plan.CodeChallengeMethod,
++		Audiences: c.Plan.Audiences, Details: details, DetailsSHA256: c.Plan.DetailsSHA256,
++	}, nil
++}
++
++// MatchPushed checks that a pushed authorization request carries exactly the
++// plan: the same client, redirect URI, PKCE challenge and (canonically) the
++// same authorization_details. The client cannot add, drop, reorder or change a
++// detail.
++func (pl *Plan) MatchPushed(clientID, redirectURI, codeChallenge, method, details string) error {
++	switch {
++	case clientID != pl.ClientID:
++		return invalid("client_id differs from the plan")
++	case redirectURI != pl.RedirectURI:
++		return invalid("redirect_uri differs from the plan")
++	case codeChallenge != pl.CodeChallenge || method != pl.CodeChallengeMethod:
++		return invalid("PKCE code_challenge differs from the plan")
++	}
++	c, err := Canonical([]byte(details))
++	if err != nil {
++		return invalid("authorization_details: %v", err)
++	}
++	if !bytes.Equal(c, pl.Details) {
++		return invalid("authorization_details differ from the plan")
++	}
++	return nil
++}
++
++// UserID and ConnectorID of the plan's subject.
++func (pl *Plan) UserID() (userID, connectorID string) {
++	var sub internal.IDTokenSubject
++	if internal.Unmarshal(pl.Subject, &sub) != nil {
++		return "", ""
++	}
++	return sub.UserId, sub.ConnId
++}
++
++// detail is the part of an authorization detail Dex interprets.
++type detail struct {
++	Type    string   `json:"type"`
++	Tool    string   `json:"tool"`
++	Actions []string `json:"actions"`
++}
++
++const maxDetails = 32
++
++// elements splits a canonical JSON array into its canonical elements.
++func elements(canonical []byte) ([]json.RawMessage, error) {
++	var out []json.RawMessage
++	if err := json.Unmarshal(canonical, &out); err != nil {
++		return nil, invalid("authorization_details must be an array")
++	}
++	return out, nil
++}
++
++// checkDetails validates canonical details for d: 1 to maxDetails distinct
++// objects, each with a type of a configured tool, that tool, and a sorted,
++// distinct, non-empty actions list; audiences name exactly the tools used,
++// each matching its tool's pattern.
++func (d *delegate) checkDetails(canonical []byte, audiences map[string]string) error {
++	els, err := elements(canonical)
++	if err != nil {
++		return err
++	}
++	if len(els) == 0 || len(els) > maxDetails {
++		return invalid("1 to %d authorization_details are required", maxDetails)
++	}
++	used := map[string]bool{}
++	seen := map[string]bool{}
++	for _, el := range els {
++		if seen[string(el)] {
++			return invalid("a detail is repeated")
++		}
++		seen[string(el)] = true
++		var dt detail
++		if err := json.Unmarshal(el, &dt); err != nil {
++			return invalid("a detail is not an object with type, tool and actions")
++		}
++		t := d.tools[dt.Tool]
++		switch {
++		case t == nil:
++			return invalid("tool %q is not configured for %s", dt.Tool, d.client)
++		case !t.types[dt.Type]:
++			return invalid("type %q is not a %s detail type", dt.Type, dt.Tool)
++		case len(dt.Actions) == 0 || !slices.IsSorted(dt.Actions) || len(slices.Compact(slices.Clone(dt.Actions))) != len(dt.Actions):
++			return invalid("actions of a %s detail must be sorted, distinct and non-empty", dt.Type)
++		}
++		for _, a := range dt.Actions {
++			if !identifier.MatchString(a) {
++				return invalid("action %q", a)
++			}
++		}
++		used[dt.Tool] = true
++	}
++	if len(audiences) != len(used) {
++		return invalid("audiences must name exactly the tools of the details")
++	}
++	for name, aud := range audiences {
++		if !used[name] || !d.tools[name].audience.MatchString(aud) {
++			return invalid("audience of %q is missing or does not match its pattern", name)
++		}
++	}
++	return nil
++}
++
++// subset returns the requested details (canonical) and their tool when they
++// are a non-empty set of distinct details of the grant, all of one tool.
++func subset(granted json.RawMessage, requested string) (json.RawMessage, string, error) {
++	c, err := Canonical([]byte(requested))
++	if err != nil {
++		return nil, "", fmt.Errorf("authorization_details: %v", err)
++	}
++	req, err := elements(c)
++	if err != nil {
++		return nil, "", err
++	}
++	have, err := elements(granted)
++	if err != nil {
++		return nil, "", err
++	}
++	if len(req) == 0 {
++		return nil, "", errors.New("authorization_details is empty")
++	}
++	toolName := ""
++	seen := map[string]bool{}
++	for _, el := range req {
++		if seen[string(el)] {
++			return nil, "", errors.New("a requested detail is repeated")
++		}
++		seen[string(el)] = true
++		if !slices.ContainsFunc(have, func(g json.RawMessage) bool { return bytes.Equal(g, el) }) {
++			return nil, "", errors.New("a requested detail is not in the operation grant")
++		}
++		var dt detail
++		_ = json.Unmarshal(el, &dt) // granted details were validated
++		if toolName != "" && dt.Tool != toolName {
++			return nil, "", errors.New("requested details name more than one tool")
++		}
++		toolName = dt.Tool
++	}
++	return c, toolName, nil
++}
++
++// Describe renders the plan's details as consent lines.
++func (p *Policy) Describe(pl *Plan) []string {
++	d := p.delegates[pl.Delegate]
++	els, _ := elements(pl.Details)
++	out := make([]string, 0, len(els))
++	for _, el := range els {
++		var m map[string]any
++		_ = json.Unmarshal(el, &m)
++		var dt detail
++		_ = json.Unmarshal(el, &dt)
++		display := dt.Tool
++		if d != nil && d.tools[dt.Tool] != nil {
++			display = d.tools[dt.Tool].display
++		}
++		out = append(out, display+": "+describe(dt, m))
++	}
++	return out
++}
++
++func describe(dt detail, m map[string]any) string {
++	str := func(k string) string { s, _ := m[k].(string); return s }
++	repo := str("owner") + "/" + str("repository")
++	switch dt.Type {
++	case "pathops_repository":
++		var verbs []string
++		for _, a := range dt.Actions {
++			switch a {
++			case "create":
++				verbs = append(verbs, "create")
++			case "seed":
++				verbs = append(verbs, "write the template's initial content to")
++			default:
++				verbs = append(verbs, a)
++			}
++		}
++		return fmt.Sprintf("%s the private repository %s", strings.Join(verbs, " and "), repo)
++	case "pathops_webhook":
++		return fmt.Sprintf("%s the webhook of %s that sends %s events to %s",
++			strings.Join(dt.Actions, " and "), repo, eventList(m["events"]), str("url"))
++	}
++	keys := make([]string, 0, len(m))
++	for k := range m {
++		if k != "type" && k != "tool" && k != "actions" {
++			keys = append(keys, k)
++		}
++	}
++	slices.Sort(keys)
++	parts := []string{dt.Type, strings.Join(dt.Actions, ",")}
++	for _, k := range keys {
++		parts = append(parts, fmt.Sprintf("%s=%v", k, m[k]))
++	}
++	return strings.Join(parts, " ")
++}
++
++func eventList(v any) string {
++	list, _ := v.([]any)
++	s := make([]string, 0, len(list))
++	for _, e := range list {
++		s = append(s, fmt.Sprint(e))
++	}
++	return strings.Join(s, ", ")
++}
+diff --git a/server/discovery/discovery.go b/server/discovery/discovery.go
+index d9119d4..2773ca1 100644
+--- a/server/discovery/discovery.go
++++ b/server/discovery/discovery.go
+@@ -13,6 +13,7 @@ import (
+ 
+ 	jose "github.com/go-jose/go-jose/v4"
+ 
++	"github.com/dexidp/dex/server/delegation"
+ 	"github.com/dexidp/dex/server/oauth2"
+ 	"github.com/dexidp/dex/server/router"
+ 	"github.com/dexidp/dex/server/signer"
+@@ -31,6 +32,8 @@ type Handler struct {
+ 	GrantTypes      []string
+ 	PKCEMethods     []string
+ 	SessionsEnabled bool
++	// Delegation advertises PathOps delegation: PAR and the detail types.
++	Delegation *delegation.Policy
+ 
+ 	docOnce sync.Once
+ 	docData []byte
+@@ -71,6 +74,9 @@ type Document struct {
+ 	Scopes                   []string `json:"scopes_supported"`
+ 	AuthMethods              []string `json:"token_endpoint_auth_methods_supported"`
+ 	Claims                   []string `json:"claims_supported"`
++	// PathOps delegation (RFC 9126, RFC 9396).
++	PAR                       string   `json:"pushed_authorization_request_endpoint,omitempty"`
++	AuthorizationDetailsTypes []string `json:"authorization_details_types_supported,omitempty"`
+ }
+ 
+ // Keys serves the JSON Web Key Set.
+@@ -176,5 +182,10 @@ func (h *Handler) Construct(ctx context.Context) Document {
+ 		d.Claims = append(d.Claims, "sid")
+ 	}
+ 
++	if h.Delegation != nil {
++		d.PAR = h.IssuerURL.AbsURL("/par")
++		d.AuthorizationDetailsTypes = h.Delegation.DetailTypes()
++	}
++
+ 	return d
+ }
+diff --git a/server/grants/authcode.go b/server/grants/authcode.go
+index d75716c..cbd396e 100644
+--- a/server/grants/authcode.go
++++ b/server/grants/authcode.go
+@@ -7,6 +7,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/dexidp/dex/server/connectors"
++	"github.com/dexidp/dex/server/delegation"
+ 	"github.com/dexidp/dex/server/oauth2"
+ 	"github.com/dexidp/dex/server/tokens"
+ 	"github.com/dexidp/dex/storage"
+@@ -20,6 +21,7 @@ type authorizationCode struct {
+ 	connectors *connectors.Cache
+ 	now        func() time.Time
+ 	logger     *slog.Logger
++	delegation *delegation.Policy
+ }
+ 
+ func (g *authorizationCode) GrantType() string {
+@@ -69,9 +71,38 @@ func (g *authorizationCode) Authorize(ctx context.Context, req *Request, client
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if len(authCode.Delegation) > 0 {
++		return g.completeDelegation(ctx, authCode, auth, withRefresh)
++	}
+ 	return issueTokens(ctx, g.logger, g.issuer, auth, authCode.ID, withRefresh)
+ }
+ 
++// completeDelegation activates the operation grant of a code issued for a
++// PathOps Authorization Plan: the plan's client redeemed it with the PKCE
++// verifier of the plan's challenge. The response carries the approved
++// authorization_details; the tokens themselves are the client's usual ones.
++func (g *authorizationCode) completeDelegation(ctx context.Context, authCode storage.AuthCode, auth tokens.Authorization, withRefresh bool) (Responder, error) {
++	d, err := delegation.DecodeRequest(authCode.Delegation)
++	if err != nil || d == nil || g.delegation == nil {
++		g.logger.ErrorContext(ctx, "auth code with unusable delegation state", "err", err)
++		return nil, &oauth2.Error{Type: oauth2.ServerError, Status: http.StatusInternalServerError}
++	}
++	grant, err := g.delegation.Activate(ctx, g.storage, &d.Plan, g.now())
++	if err != nil {
++		g.logger.InfoContext(ctx, "operation grant not activated", "plan", d.Plan.ID, "err", err)
++		return nil, &oauth2.Error{Type: oauth2.InvalidGrant, Description: "The operation grant cannot be completed: " + err.Error(), Status: http.StatusBadRequest}
++	}
++	g.logger.InfoContext(ctx, "operation grant active", "plan", d.Plan.ID, "delegate", d.Plan.Delegate,
++		"application", d.Plan.Application.Name, "run", d.Plan.Run.ID, "expires_at", grant.ExpiresAt.Format(time.RFC3339))
++	resp, err := g.issuer.IssueResponse(ctx, auth, authCode.ID, withRefresh)
++	if err != nil {
++		g.logger.ErrorContext(ctx, "failed to issue tokens", "err", err)
++		return nil, &oauth2.Error{Type: oauth2.ServerError, Status: http.StatusInternalServerError}
++	}
++	resp.AuthorizationDetails = d.Plan.Details
++	return resp, nil
++}
++
+ // ExchangeAuthCode consumes a validated authorization code and returns the
+ // authorization to issue tokens for and whether a refresh token is warranted. The
+ // caller then mints the tokens, binding authCode.ID into c_hash. It is shared by
+diff --git a/server/grants/delegation.go b/server/grants/delegation.go
+new file mode 100644
+index 0000000..3f59179
+--- /dev/null
++++ b/server/grants/delegation.go
+@@ -0,0 +1,76 @@
++package grants
++
++import (
++	"context"
++	"errors"
++	"log/slog"
++	"net/http"
++	"time"
++
++	"github.com/dexidp/dex/server/connectors"
++	"github.com/dexidp/dex/server/delegation"
++	"github.com/dexidp/dex/server/oauth2"
++	"github.com/dexidp/dex/server/signer"
++	"github.com/dexidp/dex/server/tokens"
++	"github.com/dexidp/dex/storage"
++)
++
++// delegatedGrantType is the internal key of the PathOps delegated derivation:
++// an RFC 8693 token exchange whose subject_token is an operation grant handle
++// (subject_token_type delegation.OperationGrantTokenType).
++const delegatedGrantType = "pathops:delegated-derivation"
++
++// delegatedExchange derives a short-lived tool token from an operation grant
++// for its delegate, an authenticated confidential client. The subject is the
++// grant the user approved, never a user token.
++type delegatedExchange struct {
++	policy  *delegation.Policy
++	storage storage.Storage
++	signer  signer.Signer
++	issuer  string
++	now     func() time.Time
++	logger  *slog.Logger
++}
++
++func (g *delegatedExchange) GrantType() string { return delegatedGrantType }
++
++func (g *delegatedExchange) RequiresClientAuth() bool { return true }
++
++// ScopePolicy passes scopes through: a derived token carries
++// authorization_details, not scopes, and ignores any scope parameter.
++func (g *delegatedExchange) ScopePolicy() ScopePolicy { return ScopePolicy{} }
++
++func (g *delegatedExchange) ConnectorID(context.Context, *Request, storage.Client) (string, *oauth2.Error) {
++	return "", nil
++}
++
++func (g *delegatedExchange) Authorize(ctx context.Context, req *Request, client storage.Client, _ connectors.Connector) (Responder, error) {
++	if client.Public || !g.policy.Delegate(client.ID) {
++		g.logger.InfoContext(ctx, "delegated derivation refused: not a delegate", "client_id", client.ID)
++		return nil, &oauth2.Error{Type: "unauthorized_client", Description: "only an authenticated delegate may derive delegated tokens",
++			Status: http.StatusBadRequest}
++	}
++	if req.RequestedTokenType != "" && req.RequestedTokenType != oauth2.TokenTypeAccess {
++		return nil, &oauth2.Error{Type: oauth2.InvalidRequest, Description: "requested_token_type must be an access token", Status: http.StatusBadRequest}
++	}
++	now := g.now()
++	d, err := g.policy.Derive(ctx, g.storage, g.signer, g.issuer, client.ID, req.SubjectToken, req.Audience, req.AuthorizationDetails, now)
++	var derr *delegation.DeriveError
++	if errors.As(err, &derr) {
++		g.logger.InfoContext(ctx, "delegated derivation refused", "client_id", client.ID, "error", derr.Type, "reason", derr.Description)
++		return nil, &oauth2.Error{Type: derr.Type, Description: derr.Description, Status: http.StatusBadRequest}
++	}
++	if err != nil {
++		g.logger.ErrorContext(ctx, "delegated derivation failed", "client_id", client.ID, "err", err)
++		return nil, &oauth2.Error{Type: oauth2.ServerError, Status: http.StatusInternalServerError}
++	}
++	g.logger.InfoContext(ctx, "delegated token issued", "client_id", client.ID, "audience", d.Audience,
++		"expires_at", d.Expiry.Format(time.RFC3339))
++	return tokens.Response{
++		AccessToken:          d.Token,
++		IssuedTokenType:      oauth2.TokenTypeAccess,
++		TokenType:            "bearer",
++		ExpiresIn:            int(d.Expiry.Sub(now).Seconds()),
++		AuthorizationDetails: d.Details,
++	}, nil
++}
+diff --git a/server/grants/grants.go b/server/grants/grants.go
+index 04eba65..0cbebbc 100644
+--- a/server/grants/grants.go
++++ b/server/grants/grants.go
+@@ -13,10 +13,12 @@ import (
+ 
+ 	"github.com/dexidp/dex/connector"
+ 	"github.com/dexidp/dex/server/connectors"
++	"github.com/dexidp/dex/server/delegation"
+ 	"github.com/dexidp/dex/server/internal"
+ 	"github.com/dexidp/dex/server/oauth2"
+ 	"github.com/dexidp/dex/server/router"
+ 	"github.com/dexidp/dex/server/session"
++	"github.com/dexidp/dex/server/signer"
+ 	"github.com/dexidp/dex/server/tokens"
+ 	"github.com/dexidp/dex/storage"
+ )
+@@ -49,6 +51,10 @@ type Request struct {
+ 	SubjectToken       string
+ 	SubjectTokenType   string
+ 	RequestedTokenType string
++	// Audience and AuthorizationDetails (RFC 8693, RFC 9396): the target and
++	// the details of a PathOps delegated derivation.
++	Audience             string
++	AuthorizationDetails string
+ 
+ 	// refresh holds the refresh token the refresh grant looks up while resolving
+ 	// the connector, so it is fetched and decoded once and reused in Authorize.
+@@ -77,6 +83,9 @@ func parseRequest(r *http.Request) (*Request, *oauth2.Error) {
+ 		SubjectToken:       r.PostFormValue("subject_token"),
+ 		SubjectTokenType:   r.PostFormValue("subject_token_type"),
+ 		RequestedTokenType: r.PostFormValue("requested_token_type"),
++
++		Audience:             r.PostFormValue("audience"),
++		AuthorizationDetails: r.PostFormValue("authorization_details"),
+ 	}
+ 
+ 	if id, secret, ok := r.BasicAuth(); ok {
+@@ -161,6 +170,11 @@ type Handler struct {
+ 	Sessions            *session.Manager
+ 	SessionsEnabled     bool
+ 	SupportedGrantTypes []string
++	// Delegation and Signer serve PathOps delegated derivations (nil:
++	// disabled): a token exchange whose subject is an operation grant.
++	Delegation *delegation.Policy
++	Signer     signer.Signer
++	IssuerURL  string
+ 
+ 	grants map[string]Grant
+ }
+@@ -182,10 +196,15 @@ func (h *Handler) Mount(m router.Mux) {
+ 		&clientCredentials{issuer: h.Issuer, logger: h.Logger},
+ 		&password{issuer: h.Issuer, logger: h.Logger, connectorID: h.PasswordConnector},
+ 		&tokenExchange{issuer: h.Issuer, logger: h.Logger},
+-		&authorizationCode{issuer: h.Issuer, storage: h.Storage, connectors: h.Connectors, now: h.Now, logger: h.Logger},
++		&authorizationCode{issuer: h.Issuer, storage: h.Storage, connectors: h.Connectors, now: h.Now, logger: h.Logger,
++			delegation: h.Delegation},
+ 		&refresh{storage: h.Storage, issuer: h.Issuer, policy: h.RefreshPolicy, sessions: h.Sessions, sessionsEnabled: h.SessionsEnabled, now: h.Now, logger: h.Logger},
+ 		&deviceCode{storage: h.Storage, now: h.Now, logger: h.Logger},
+ 	)
++	if h.Delegation != nil && slices.Contains(h.SupportedGrantTypes, oauth2.GrantTypeTokenExchange) {
++		h.grants[delegatedGrantType] = &delegatedExchange{policy: h.Delegation, storage: h.Storage, signer: h.Signer,
++			issuer: h.IssuerURL, now: h.Now, logger: h.Logger}
++	}
+ 	m.HandleCORS("/token", h.handleToken)
+ }
+ 
+@@ -205,6 +224,9 @@ func (h *Handler) handleToken(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	grantType := r.PostFormValue("grant_type")
++	if grantType == oauth2.GrantTypeTokenExchange && r.PostFormValue("subject_token_type") == delegation.OperationGrantTokenType {
++		grantType = delegatedGrantType
++	}
+ 	if !h.dispatch(w, r, grantType) {
+ 		h.Logger.ErrorContext(ctx, "unsupported grant type", "grant_type", grantType)
+ 		h.writeError(ctx, w, &oauth2.Error{Type: oauth2.UnsupportedGrantType, Status: http.StatusBadRequest})
+diff --git a/server/server.go b/server/server.go
+index 6433b61..6113232 100644
+--- a/server/server.go
++++ b/server/server.go
+@@ -123,6 +123,10 @@ func newServer(ctx context.Context, c Config) (*Server, error) {
+ 		GrantTypes:      rc.grantTypes,
+ 		PKCEMethods:     c.PKCE.CodeChallengeMethodsSupported,
+ 		SessionsEnabled: c.SessionConfig != nil,
++		Delegation:      c.Delegation,
++	}
++	if c.Delegation != nil && !s.templates.HasDelegation() {
++		return nil, errors.New("server: delegation is configured but the frontend has no delegation.html template")
+ 	}
+ 
+ 	if err := s.openConnectors(ctx, c); err != nil {
+@@ -246,6 +250,9 @@ func (s *Server) mount(routes router.Mux, c Config, rc resolvedConfig) {
+ 			Sessions:            sessions,
+ 			SessionsEnabled:     c.SessionConfig != nil,
+ 			SupportedGrantTypes: rc.grantTypes,
++			Delegation:          c.Delegation,
++			Signer:              c.Signer,
++			IssuerURL:           s.issuerURL.String(),
+ 		},
+ 		&userinfo.Handler{
+ 			Issuer: s.issuerURL.String(),
+@@ -294,6 +301,7 @@ func (s *Server) mount(routes router.Mux, c Config, rc resolvedConfig) {
+ 			MFAEnabled:             len(c.MFAProviders) > 0,
+ 			DefaultMFAChain:        c.DefaultMFAChain,
+ 			SkipApproval:           c.SkipApprovalScreen,
++			Delegation:             c.Delegation,
+ 		},
+ 		&mfa.Handler{
+ 			Storage:         s.storage,
+@@ -312,6 +320,8 @@ func (s *Server) mount(routes router.Mux, c Config, rc resolvedConfig) {
+ 			IssuerURL:    s.issuerURL,
+ 			Sessions:     sessions,
+ 			SkipApproval: c.SkipApprovalScreen,
++			Delegation:   c.Delegation,
++			Now:          rc.now,
+ 		},
+ 		&logout.Handler{
+ 			Storage:     s.storage,
+diff --git a/server/server_delegation_test.go b/server/server_delegation_test.go
+new file mode 100644
+index 0000000..4ed30dd
+--- /dev/null
++++ b/server/server_delegation_test.go
+@@ -0,0 +1,600 @@
++package server
++
++import (
++	"crypto/ed25519"
++	"crypto/rand"
++	"crypto/sha256"
++	"encoding/base64"
++	"encoding/hex"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strings"
++	"testing"
++	"time"
++
++	jose "github.com/go-jose/go-jose/v4"
++	"github.com/stretchr/testify/require"
++
++	"github.com/dexidp/dex/server/delegation"
++	"github.com/dexidp/dex/server/tokens"
++	"github.com/dexidp/dex/storage"
++)
++
++const (
++	dlgCLI         = "pathops-cli"
++	dlgTCP         = "pathops-tenant-control-plane"
++	dlgTCPSecret   = "tcp-secret"
++	dlgOther       = "other-confidential"
++	dlgRedirect    = "http://127.0.0.1:5555/callback"
++	dlgPlanIssuer  = "https://tcp.example.test"
++	dlgAudience    = "u:7:2f0c6a51-8d7e-4b8e-9c55-3a2f0e9b1c44"
++	dlgMockUserID  = "0-385-28089-0"
++	dlgWebhookBase = "http://tenant-control-plane.pathops.svc:8080/api/v1/webhooks/forgejo/"
++)
++
++type dlgEnv struct {
++	t       *testing.T
++	s       *Server
++	issuer  string
++	clock   *time.Time
++	key     ed25519.PrivateKey
++	kid     string
++	subject string
++}
++
++func newDelegationEnv(t *testing.T) *dlgEnv {
++	t.Helper()
++	pub, priv, err := ed25519.GenerateKey(rand.Reader)
++	require.NoError(t, err)
++	clock := time.Now()
++	e := &dlgEnv{t: t, clock: &clock, key: priv, kid: "plan-1"}
++	_, s := newTestServer(t, func(c *Config) {
++		c.Now = func() time.Time { return *e.clock }
++		policy, err := delegation.NewPolicy(delegation.Config{
++			PlanClients: []string{dlgCLI},
++			Delegates: []delegation.DelegateConfig{{
++				Client: dlgTCP, Name: "PathOps Tenant Control Plane (test)", PlanIssuer: dlgPlanIssuer,
++				PlanKeys: []delegation.KeyConfig{{KeyID: "plan-1", Ed25519: base64.RawURLEncoding.EncodeToString(pub)}},
++				Tools: []delegation.ToolConfig{{Name: "forgejo", DisplayName: "Forgejo",
++					AudiencePattern: `u:[0-9]+:[0-9a-f-]{36}`, DetailTypes: []string{"pathops_repository", "pathops_webhook"}}},
++			}},
++		})
++		require.NoError(t, err)
++		c.Delegation = policy
++		for _, cl := range []storage.Client{
++			{ID: dlgCLI, Public: true, RedirectURIs: []string{dlgRedirect}, Name: "PathOps CLI"},
++			{ID: dlgTCP, Secret: dlgTCPSecret, Name: "PathOps Tenant Control Plane"},
++			{ID: dlgOther, Secret: "other-secret", Name: "Other"},
++		} {
++			require.NoError(t, c.Storage.CreateClient(t.Context(), cl))
++		}
++		e.issuer = c.Issuer
++	})
++	e.s = s
++	e.subject, err = tokens.GenSubject(dlgMockUserID, "mock")
++	require.NoError(t, err)
++	return e
++}
++
++func dlgDetails(owner, app, appID string) []map[string]any {
++	repo := func(name string) map[string]any {
++		return map[string]any{"type": "pathops_repository", "version": 1, "tool": "forgejo", "owner": owner,
++			"repository": name, "actions": []string{"create", "seed"}}
++	}
++	return []map[string]any{
++		repo(app), repo(app + "-gitops-preflight"), repo(app + "-gitops-production"),
++		{"type": "pathops_webhook", "version": 1, "tool": "forgejo", "owner": owner, "repository": app,
++			"url": dlgWebhookBase + appID, "events": []string{"push"}, "actions": []string{"configure"}},
++	}
++}
++
++func randomHex(n int) string {
++	b := make([]byte, n)
++	_, _ = rand.Read(b)
++	return hex.EncodeToString(b)
++}
++
++func mustJSON(t *testing.T, v any) string {
++	t.Helper()
++	b, err := json.Marshal(v)
++	require.NoError(t, err)
++	return string(b)
++}
++
++type dlgPKCE struct{ verifier, challenge string }
++
++func newPKCE() dlgPKCE {
++	b := make([]byte, 32)
++	_, _ = rand.Read(b)
++	v := base64.RawURLEncoding.EncodeToString(b)
++	sum := sha256.Sum256([]byte(v))
++	return dlgPKCE{v, base64.RawURLEncoding.EncodeToString(sum[:])}
++}
++
++// plan builds and signs a plan for app; mod may change the claims first.
++func (e *dlgEnv) plan(app string, pk dlgPKCE, details []map[string]any, mod func(map[string]any)) (string, string) {
++	t := e.t
++	raw := mustJSON(t, details)
++	canonical, err := delegation.Canonical([]byte(raw))
++	require.NoError(t, err)
++	now := *e.clock
++	appID := "11111111-2222-4333-8444-" + strings.Repeat("a", 12)
++	if app == "app-b" {
++		appID = "11111111-2222-4333-8444-" + strings.Repeat("b", 12)
++	}
++	claims := map[string]any{
++		"iss": dlgPlanIssuer, "aud": e.issuer, "sub": e.subject, "jti": "plan-" + app + "-" + randomHex(8),
++		"iat": now.Unix(), "exp": now.Add(10 * time.Minute).Unix(),
++		"pathops_plan": map[string]any{
++			"version": 1, "installation": "dev", "operation": "CREATE_APPLICATION",
++			"application": map[string]any{"id": appID, "name": app},
++			"run":         map[string]any{"id": "33333333-2222-4333-8444-" + strings.Repeat("c", 12)},
++			"template":    map[string]any{"id": "generic-container", "source": "https://github.com/PathOps/pathops-templates", "ref": "main"},
++			"client_id":   dlgCLI, "redirect_uri": dlgRedirect, "code_challenge": pk.challenge, "code_challenge_method": "S256",
++			"audiences":                    map[string]any{"forgejo": dlgAudience},
++			"authorization_details_sha256": delegation.DigestOf(canonical),
++		},
++		"authorization_details": json.RawMessage(canonical),
++	}
++	if mod != nil {
++		mod(claims)
++	}
++	return e.sign(e.key, e.kid, claims), raw
++}
++
++func (e *dlgEnv) sign(key ed25519.PrivateKey, kid string, claims map[string]any) string {
++	opts := (&jose.SignerOptions{}).WithType(delegation.PlanTokenType).WithHeader(jose.HeaderKey("kid"), kid)
++	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.EdDSA, Key: key}, opts)
++	require.NoError(e.t, err)
++	jws, err := sig.Sign([]byte(mustJSON(e.t, claims)))
++	require.NoError(e.t, err)
++	out, err := jws.CompactSerialize()
++	require.NoError(e.t, err)
++	return out
++}
++
++func (e *dlgEnv) do(method, target string, form url.Values, basic ...string) *httptest.ResponseRecorder {
++	var req *http.Request
++	if form != nil {
++		req = httptest.NewRequest(method, target, strings.NewReader(form.Encode()))
++		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
++	} else {
++		req = httptest.NewRequest(method, target, nil)
++	}
++	if len(basic) == 2 {
++		req.SetBasicAuth(basic[0], basic[1])
++	}
++	rr := httptest.NewRecorder()
++	e.s.ServeHTTP(rr, req)
++	return rr
++}
++
++func (e *dlgEnv) par(plan, details string, pk dlgPKCE) *httptest.ResponseRecorder {
++	return e.do(http.MethodPost, "/par", url.Values{
++		"client_id": {dlgCLI}, "response_type": {"code"}, "scope": {"openid email profile"},
++		"redirect_uri": {dlgRedirect}, "state": {"st"}, "code_challenge": {pk.challenge},
++		"code_challenge_method": {"S256"}, "authorization_details": {details}, "pathops_authorization_plan": {plan},
++	})
++}
++
++func (e *dlgEnv) requestURI(plan, details string, pk dlgPKCE) string {
++	rr := e.par(plan, details, pk)
++	require.Equal(e.t, http.StatusCreated, rr.Code, rr.Body.String())
++	var out struct {
++		RequestURI string `json:"request_uri"`
++		ExpiresIn  int    `json:"expires_in"`
++	}
++	require.NoError(e.t, json.Unmarshal(rr.Body.Bytes(), &out))
++	require.True(e.t, strings.HasPrefix(out.RequestURI, delegation.RequestURIPrefix))
++	require.Equal(e.t, 90, out.ExpiresIn)
++	return out.RequestURI
++}
++
++// browse follows redirects from target until a page renders or the client's
++// redirect URI is reached.
++func (e *dlgEnv) browse(target string) (*httptest.ResponseRecorder, *url.URL) {
++	rr := e.do(http.MethodGet, target, nil)
++	for range 12 {
++		if rr.Code != http.StatusFound && rr.Code != http.StatusSeeOther {
++			return rr, nil
++		}
++		u, err := url.Parse(rr.Header().Get("Location"))
++		require.NoError(e.t, err)
++		if u.Host == "127.0.0.1:5555" {
++			return rr, u
++		}
++		rr = e.do(http.MethodGet, u.RequestURI(), nil)
++	}
++	e.t.Fatal("redirect loop")
++	return nil, nil
++}
++
++// consent starts the browser at request_uri and returns the consent page and
++// its URL (with req and hmac).
++func (e *dlgEnv) consent(requestURI string) (string, string) {
++	q := url.Values{"client_id": {dlgCLI}, "request_uri": {requestURI}}
++	rr := e.do(http.MethodGet, "/auth?"+q.Encode(), nil)
++	var page string
++	for range 12 {
++		require.Contains(e.t, []int{http.StatusFound, http.StatusSeeOther}, rr.Code, rr.Body.String())
++		loc := rr.Header().Get("Location")
++		u, err := url.Parse(loc)
++		require.NoError(e.t, err)
++		next := e.do(http.MethodGet, u.RequestURI(), nil)
++		if strings.HasSuffix(u.Path, "/approval") && next.Code == http.StatusOK {
++			page = next.Body.String()
++			return page, u.RequestURI()
++		}
++		rr = next
++	}
++	e.t.Fatal("no consent page")
++	return "", ""
++}
++
++func (e *dlgEnv) approve(approvalURL, decision string) *url.URL {
++	rr := e.do(http.MethodPost, approvalURL, url.Values{"approval": {decision}})
++	require.Equal(e.t, http.StatusSeeOther, rr.Code, rr.Body.String())
++	u, err := url.Parse(rr.Header().Get("Location"))
++	require.NoError(e.t, err)
++	if u.Host == "127.0.0.1:5555" {
++		return u
++	}
++	_, cb := e.browse(u.RequestURI())
++	require.NotNil(e.t, cb)
++	return cb
++}
++
++func (e *dlgEnv) redeem(code string, pk dlgPKCE) *httptest.ResponseRecorder {
++	return e.do(http.MethodPost, "/token", url.Values{"grant_type": {"authorization_code"}, "code": {code},
++		"redirect_uri": {dlgRedirect}, "code_verifier": {pk.verifier}, "client_id": {dlgCLI}})
++}
++
++func (e *dlgEnv) derive(handle, audience string, details []map[string]any, basic ...string) *httptest.ResponseRecorder {
++	if basic == nil {
++		basic = []string{dlgTCP, dlgTCPSecret}
++	}
++	return e.do(http.MethodPost, "/token", url.Values{
++		"grant_type":            {"urn:ietf:params:oauth:grant-type:token-exchange"},
++		"subject_token":         {handle},
++		"subject_token_type":    {delegation.OperationGrantTokenType},
++		"requested_token_type":  {"urn:ietf:params:oauth:token-type:access_token"},
++		"audience":              {audience},
++		"authorization_details": {mustJSON(e.t, details)},
++	}, basic...)
++}
++
++// granted runs the whole flow for app and returns the plan id.
++func (e *dlgEnv) granted(app string) (string, []map[string]any) {
++	pk := newPKCE()
++	details := dlgDetails("kilgore", app, "app-id-"+app)
++	plan, raw := e.plan(app, pk, details, nil)
++	page, approval := e.consent(e.requestURI(plan, raw, pk))
++	require.Contains(e.t, page, "kilgore/"+app)
++	cb := e.approve(approval, "approve")
++	code := cb.Query().Get("code")
++	require.NotEmpty(e.t, code)
++	rr := e.redeem(code, pk)
++	require.Equal(e.t, http.StatusOK, rr.Code, rr.Body.String())
++	return planID(e.t, plan), details
++}
++
++func planID(t *testing.T, plan string) string {
++	jws, err := jose.ParseSigned(plan, []jose.SignatureAlgorithm{jose.EdDSA})
++	require.NoError(t, err)
++	var c struct {
++		ID string `json:"jti"`
++	}
++	require.NoError(t, json.Unmarshal(jws.UnsafePayloadWithoutVerification(), &c))
++	return c.ID
++}
++
++func jwtClaims(t *testing.T, tok string) map[string]any {
++	parts := strings.Split(tok, ".")
++	require.Len(t, parts, 3)
++	b, err := base64.RawURLEncoding.DecodeString(parts[1])
++	require.NoError(t, err)
++	var m map[string]any
++	require.NoError(t, json.Unmarshal(b, &m))
++	return m
++}
++
++func errorOf(t *testing.T, rr *httptest.ResponseRecorder) string {
++	var e struct {
++		Error string `json:"error"`
++	}
++	_ = json.Unmarshal(rr.Body.Bytes(), &e)
++	return e.Error
++}
++
++func TestDelegationFlow(t *testing.T) {
++	e := newDelegationEnv(t)
++
++	pk := newPKCE()
++	details := dlgDetails("kilgore", "app-a", "app-id-app-a")
++	plan, raw := e.plan("app-a", pk, details, nil)
++	id := planID(t, plan)
++	handle := delegation.Handle(id, e.subject)
++
++	page, approval := e.consent(e.requestURI(plan, raw, pk))
++	for _, want := range []string{"PathOps Tenant Control Plane (test)", "CREATE_APPLICATION", "app-a",
++		"Forgejo: create and write the template&#39;s initial content to the private repository kilgore/app-a",
++		"kilgore/app-a-gitops-preflight", "kilgore/app-a-gitops-production",
++		"Forgejo: configure the webhook of kilgore/app-a that sends push events to " + dlgWebhookBase + "app-id-app-a"} {
++		require.Contains(t, page, want)
++	}
++
++	// Approved but not completed: no tool token yet.
++	cb := e.approve(approval, "approve")
++	require.Equal(t, "st", cb.Query().Get("state"))
++	rr := e.derive(handle, dlgAudience, details[:1])
++	require.Equal(t, http.StatusBadRequest, rr.Code)
++	require.Equal(t, "invalid_grant", errorOf(t, rr))
++
++	// A wrong PKCE verifier does not complete it.
++	code := cb.Query().Get("code")
++	require.Equal(t, http.StatusBadRequest, e.redeem(code, newPKCE()).Code)
++
++	rr = e.redeem(code, pk)
++	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
++	var tr struct {
++		AccessToken          string          `json:"access_token"`
++		RefreshToken         string          `json:"refresh_token"`
++		AuthorizationDetails json.RawMessage `json:"authorization_details"`
++	}
++	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &tr))
++	canonical, _ := delegation.Canonical([]byte(raw))
++	require.JSONEq(t, string(canonical), string(tr.AuthorizationDetails))
++	require.Equal(t, dlgCLI, jwtClaims(t, tr.AccessToken)["aud"], "the CLI's own token is unchanged")
++
++	// One Step: the source repository only.
++	rr = e.derive(handle, dlgAudience, details[:1])
++	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
++	var dr struct {
++		AccessToken          string          `json:"access_token"`
++		IssuedTokenType      string          `json:"issued_token_type"`
++		ExpiresIn            int             `json:"expires_in"`
++		RefreshToken         string          `json:"refresh_token"`
++		AuthorizationDetails json.RawMessage `json:"authorization_details"`
++	}
++	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &dr))
++	require.Empty(t, dr.RefreshToken)
++	require.Equal(t, "urn:ietf:params:oauth:token-type:access_token", dr.IssuedTokenType)
++	require.Equal(t, 300, dr.ExpiresIn)
++	c := jwtClaims(t, dr.AccessToken)
++	require.Equal(t, dlgAudience, c["aud"])
++	require.Equal(t, dlgTCP, c["azp"])
++	require.Equal(t, e.subject, c["sub"])
++	require.Equal(t, e.issuer, c["iss"])
++	require.Equal(t, id, c["pathops_grant"])
++	require.EqualValues(t, 300, c["exp"].(float64)-c["iat"].(float64))
++	one, _ := delegation.Canonical([]byte(mustJSON(t, details[:1])))
++	require.JSONEq(t, string(one), mustJSON(t, c["authorization_details"]))
++
++	// The webhook Step gets only the webhook detail.
++	rr = e.derive(handle, dlgAudience, details[3:])
++	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
++	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &dr))
++	require.Len(t, jwtClaims(t, dr.AccessToken)["authorization_details"], 1)
++	require.Equal(t, "pathops_webhook", jwtClaims(t, dr.AccessToken)["authorization_details"].([]any)[0].(map[string]any)["type"])
++
++	// Negative derivations.
++	other := dlgDetails("kilgore", "app-b", "app-id-app-b")
++	otherUser, err := tokens.GenSubject("someone-else", "mock")
++	require.NoError(t, err)
++	widened := []map[string]any{{"type": "pathops_repository", "version": 1, "tool": "forgejo", "owner": "kilgore",
++		"repository": "app-a", "actions": []string{"create", "delete", "seed"}}}
++	for name, tc := range map[string]struct {
++		handle, audience string
++		details          []map[string]any
++		basic            []string
++		code             int
++		err              string
++	}{
++		"public client":         {handle, dlgAudience, details[:1], []string{dlgCLI, ""}, 400, "unauthorized_client"},
++		"wrong secret":          {handle, dlgAudience, details[:1], []string{dlgTCP, "nope"}, 401, "invalid_client"},
++		"not a delegate":        {handle, dlgAudience, details[:1], []string{dlgOther, "other-secret"}, 400, "unauthorized_client"},
++		"another application":   {handle, dlgAudience, other[:1], nil, 400, "invalid_authorization_details"},
++		"another app's webhook": {handle, dlgAudience, other[3:], nil, 400, "invalid_authorization_details"},
++		"widened action":        {handle, dlgAudience, widened, nil, 400, "invalid_authorization_details"},
++		"empty":                 {handle, dlgAudience, []map[string]any{}, nil, 400, "invalid_authorization_details"},
++		"wrong audience":        {handle, "u:8:2f0c6a51-8d7e-4b8e-9c55-3a2f0e9b1c44", details[:1], nil, 400, "invalid_target"},
++		"unknown grant":         {delegation.Handle("plan-nope-00000000", e.subject), dlgAudience, details[:1], nil, 400, "invalid_grant"},
++		"another user's handle": {delegation.Handle(id, otherUser), dlgAudience, details[:1], nil, 400, "invalid_grant"},
++		"user token as subject": {tr.AccessToken, dlgAudience, details[:1], nil, 400, "invalid_grant"},
++	} {
++		t.Run(name, func(t *testing.T) {
++			rr := e.derive(tc.handle, tc.audience, tc.details, tc.basic...)
++			require.Equal(t, tc.code, rr.Code, rr.Body.String())
++			require.Equal(t, tc.err, errorOf(t, rr))
++		})
++	}
++
++	// The grant expires: no more tokens; a token never outlives the grant.
++	*e.clock = e.clock.Add(13 * time.Minute)
++	rr = e.derive(handle, dlgAudience, details[1:2])
++	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
++	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &dr))
++	require.Equal(t, 120, dr.ExpiresIn)
++	*e.clock = e.clock.Add(3 * time.Minute)
++	rr = e.derive(handle, dlgAudience, details[1:2])
++	require.Equal(t, http.StatusBadRequest, rr.Code)
++	require.Contains(t, rr.Body.String(), "expired")
++}
++
++func TestDelegationOperationsAreSeparate(t *testing.T) {
++	e := newDelegationEnv(t)
++	idA, detailsA := e.granted("app-a")
++	idB, detailsB := e.granted("app-b")
++	require.NotEqual(t, idA, idB)
++
++	hA, hB := delegation.Handle(idA, e.subject), delegation.Handle(idB, e.subject)
++	require.Equal(t, http.StatusOK, e.derive(hA, dlgAudience, detailsA[:1]).Code)
++	require.Equal(t, http.StatusOK, e.derive(hB, dlgAudience, detailsB[:1]).Code)
++	for i := range detailsB {
++		rr := e.derive(hA, dlgAudience, detailsB[i:i+1])
++		require.Equal(t, "invalid_authorization_details", errorOf(t, rr), "app-a's grant must not cover %v", detailsB[i])
++	}
++}
++
++func TestDelegationPushedRequestChecks(t *testing.T) {
++	e := newDelegationEnv(t)
++	pk := newPKCE()
++	details := dlgDetails("kilgore", "app-a", "app-id-app-a")
++	good, raw := e.plan("app-a", pk, details, nil)
++
++	_, otherKey, err := ed25519.GenerateKey(rand.Reader)
++	require.NoError(t, err)
++	field := func(k string, v any) func(map[string]any) {
++		return func(c map[string]any) { c["pathops_plan"].(map[string]any)[k] = v }
++	}
++	claim := func(k string, v any) func(map[string]any) { return func(c map[string]any) { c[k] = v } }
++	withKey := func(k ed25519.PrivateKey, kid string) string {
++		old, oldKid := e.key, e.kid
++		e.key, e.kid = k, kid
++		defer func() { e.key, e.kid = old, oldKid }()
++		p, _ := e.plan("app-a", pk, details, nil)
++		return p
++	}
++	changedRepo := dlgDetails("kilgore", "app-a", "app-id-app-a")
++	changedRepo[0]["repository"] = "app-z"
++	changedAction := dlgDetails("kilgore", "app-a", "app-id-app-a")
++	changedAction[3]["actions"] = []string{"configure", "delete"}
++	extra := append(dlgDetails("kilgore", "app-a", "app-id-app-a"), dlgDetails("kilgore", "app-b", "x")[0])
++
++	cases := map[string]struct {
++		plan, details string
++		pk            dlgPKCE
++		want          string
++	}{
++		"changed repository":   {good, mustJSON(t, changedRepo), pk, "authorization_details differ from the plan"},
++		"changed action":       {good, mustJSON(t, changedAction), pk, "authorization_details differ from the plan"},
++		"added detail":         {good, mustJSON(t, extra), pk, "authorization_details differ from the plan"},
++		"dropped detail":       {good, mustJSON(t, details[:3]), pk, "authorization_details differ from the plan"},
++		"reordered details":    {good, mustJSON(t, []map[string]any{details[1], details[0], details[2], details[3]}), pk, "authorization_details differ from the plan"},
++		"other PKCE challenge": {good, raw, newPKCE(), "code_challenge differs from the plan"},
++		"unknown signing key":  {withKey(otherKey, "plan-1"), raw, pk, "bad signature"},
++		"unknown kid":          {withKey(e.key, "plan-2"), raw, pk, "unknown plan key"},
++		"no plan":              {"", raw, pk, "missing or too large"},
++		"expired plan": {func() string {
++			p, _ := e.plan("app-a", pk, details, func(c map[string]any) {
++				c["iat"], c["exp"] = time.Now().Add(-12*time.Minute).Unix(), time.Now().Add(-2*time.Minute).Unix()
++			})
++			return p
++		}(), raw, pk, "expired"},
++		"plan for another Dex": {func() string { p, _ := e.plan("app-a", pk, details, claim("aud", "https://other.example")); return p }(), raw, pk, "audience is not this issuer"},
++		"subject changed":      {func() string { p, _ := e.plan("app-a", pk, details, claim("sub", "x")); return p }(), raw, pk, "sub is not a subject"},
++		"redirect changed": {func() string {
++			p, _ := e.plan("app-a", pk, details, field("redirect_uri", "http://127.0.0.1:9999/cb"))
++			return p
++		}(), raw, pk, "redirect_uri differs from the plan"},
++		"other client": {func() string { p, _ := e.plan("app-a", pk, details, field("client_id", dlgOther)); return p }(), raw, pk, "client_id may not carry plans"},
++		"digest mismatch": {func() string {
++			p, _ := e.plan("app-a", pk, details, field("authorization_details_sha256", "AAAA"))
++			return p
++		}(), raw, pk, "authorization_details_sha256 does not match"},
++		"plain challenge method": {func() string { p, _ := e.plan("app-a", pk, details, field("code_challenge_method", "plain")); return p }(), raw, pk, "S256 code_challenge is required"},
++		"long-lived plan": {func() string {
++			p, _ := e.plan("app-a", pk, details, claim("exp", time.Now().Add(2*time.Hour).Unix()))
++			return p
++		}(), raw, pk, "lifetime above"},
++		"unknown claim": {func() string { p, _ := e.plan("app-a", pk, details, claim("scope", "all")); return p }(), raw, pk, "unexpected claims"},
++		"application changed": {func() string {
++			p, _ := e.plan("app-a", pk, details, field("application", map[string]any{"id": "x", "name": "app-b"}))
++			return p
++		}(), raw, pk, "application or run"},
++		"run changed": {func() string {
++			p, _ := e.plan("app-a", pk, details, field("run", map[string]any{"id": "nope"}))
++			return p
++		}(), raw, pk, "application or run"},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			rr := e.par(tc.plan, tc.details, tc.pk)
++			require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
++			require.Contains(t, rr.Body.String(), tc.want)
++		})
++	}
++
++	// A plan whose fields were changed after signing does not verify.
++	parts := strings.Split(good, ".")
++	var payload map[string]any
++	b, _ := base64.RawURLEncoding.DecodeString(parts[1])
++	require.NoError(t, json.Unmarshal(b, &payload))
++	payload["pathops_plan"].(map[string]any)["run"] = map[string]any{"id": "44444444-2222-4333-8444-dddddddddddd"}
++	parts[1] = base64.RawURLEncoding.EncodeToString([]byte(mustJSON(t, payload)))
++	rr := e.par(strings.Join(parts, "."), raw, pk)
++	require.Equal(t, http.StatusBadRequest, rr.Code)
++	require.Contains(t, rr.Body.String(), "bad signature")
++
++	// The pathops-cli client cannot send details on the front channel.
++	q := url.Values{"client_id": {dlgCLI}, "response_type": {"code"}, "scope": {"openid"}, "redirect_uri": {dlgRedirect},
++		"state": {"s"}, "code_challenge": {pk.challenge}, "code_challenge_method": {"S256"}, "authorization_details": {raw}}
++	rr = e.do(http.MethodGet, "/auth/mock?"+q.Encode(), nil)
++	require.Equal(t, http.StatusSeeOther, rr.Code)
++	require.Contains(t, rr.Header().Get("Location"), "error=invalid_request")
++
++	// A confidential client that is not a plan client cannot push.
++	rr = e.do(http.MethodPost, "/par", url.Values{"client_id": {dlgTCP}, "client_secret": {dlgTCPSecret}})
++	require.Equal(t, "unauthorized_client", errorOf(t, rr))
++
++	// A request_uri starts one flow, before it expires.
++	uri := e.requestURI(good, raw, pk)
++	_, _ = e.consent(uri)
++	q = url.Values{"client_id": {dlgCLI}, "request_uri": {uri}}
++	rr, _ = e.browse("/auth?" + q.Encode())
++	require.Equal(t, http.StatusBadRequest, rr.Code)
++	require.Contains(t, rr.Body.String(), "already used")
++
++	uri = e.requestURI(good, raw, pk)
++	*e.clock = e.clock.Add(91 * time.Second)
++	rr, _ = e.browse("/auth?" + url.Values{"client_id": {dlgCLI}, "request_uri": {uri}}.Encode())
++	require.Equal(t, http.StatusBadRequest, rr.Code)
++}
++
++func TestDelegationConsent(t *testing.T) {
++	e := newDelegationEnv(t)
++	pk := newPKCE()
++	details := dlgDetails("kilgore", "app-a", "app-id-app-a")
++
++	// The user rejects: the client gets access_denied and no grant exists.
++	plan, raw := e.plan("app-a", pk, details, nil)
++	_, approval := e.consent(e.requestURI(plan, raw, pk))
++	cb := e.approve(approval, "rejected")
++	require.Equal(t, "access_denied", cb.Query().Get("error"))
++	require.Equal(t, "invalid_grant", errorOf(t, e.derive(delegation.Handle(planID(t, plan), e.subject), dlgAudience, details[:1])))
++
++	// A plan prepared for another user is refused after login.
++	otherSub, err := tokens.GenSubject("someone-else", "mock")
++	require.NoError(t, err)
++	plan, raw = e.plan("app-a", pk, details, func(c map[string]any) { c["sub"] = otherSub })
++	q := url.Values{"client_id": {dlgCLI}, "request_uri": {e.requestURI(plan, raw, pk)}}
++	rr, _ := e.browse("/auth?" + q.Encode())
++	require.Equal(t, http.StatusForbidden, rr.Code)
++	require.Contains(t, rr.Body.String(), "another user")
++
++	// Discovery advertises PAR and the detail types.
++	rr = e.do(http.MethodGet, "/.well-known/openid-configuration", nil)
++	var d map[string]any
++	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &d))
++	require.Equal(t, e.issuer+"/par", d["pushed_authorization_request_endpoint"])
++	require.Equal(t, []any{"pathops_repository", "pathops_webhook"}, d["authorization_details_types_supported"])
++}
++
++func TestDelegationCanonical(t *testing.T) {
++	for in, want := range map[string]string{
++		`[ {"b":1, "a":"x"} ]`:                `[{"a":"x","b":1}]`,
++		`{"k":["z","a"],"q":"a\"b\\c"}`:       `{"k":["z","a"],"q":"a\"b\\c"}`,
++		`{"n":-12,"t":true,"f":false,"o":{}}`: `{"f":false,"n":-12,"o":{},"t":true}`,
++	} {
++		got, err := delegation.Canonical([]byte(in))
++		require.NoError(t, err, in)
++		require.Equal(t, want, string(got))
++	}
++	for _, bad := range []string{`{"a":1,"a":2}`, `{"a":null}`, `{"a":1.5}`, `{"a":1e3}`, `{"a":"é"}`, `{"a":"\u0001"}`,
++		`[1] [2]`, `{"a":9007199254740992}`, `{"a":-0}`, strings.Repeat("[", 12) + strings.Repeat("]", 12)} {
++		_, err := delegation.Canonical([]byte(bad))
++		require.Error(t, err, bad)
++	}
++}
+diff --git a/server/templates/templates.go b/server/templates/templates.go
+index cc5e3dd..76ade09 100644
+--- a/server/templates/templates.go
++++ b/server/templates/templates.go
+@@ -29,6 +29,8 @@ const (
+ 	tmplWebAuthnVerify = "webauthn_verify.html"
+ 	tmplHome           = "home.html"
+ 	tmplLogout         = "logout.html"
++	// tmplDelegation is optional: only PathOps delegation needs it.
++	tmplDelegation = "delegation.html"
+ )
+ 
+ var requiredTmpls = []string{
+@@ -57,6 +59,7 @@ type Templates struct {
+ 	webauthnVerifyTmpl *template.Template
+ 	homeTmpl           *template.Template
+ 	logoutTmpl         *template.Template
++	delegationTmpl     *template.Template
+ }
+ 
+ type Config struct {
+@@ -188,6 +191,7 @@ func loadTemplates(c Config, templatesDir string) (*Templates, error) {
+ 		webauthnVerifyTmpl: tmpls.Lookup(tmplWebAuthnVerify),
+ 		homeTmpl:           tmpls.Lookup(tmplHome),
+ 		logoutTmpl:         tmpls.Lookup(tmplLogout),
++		delegationTmpl:     tmpls.Lookup(tmplDelegation),
+ 	}, nil
+ }
+ 
+@@ -368,6 +372,36 @@ func (t *Templates) Approval(r *http.Request, w http.ResponseWriter, authReqID,
+ 	return renderTemplate(w, t.approvalTmpl, data)
+ }
+ 
++// DelegationPage is the consent screen of a PathOps Authorization Plan.
++type DelegationPage struct {
++	AuthReqID   string
++	User        string
++	Delegate    string
++	Operation   string
++	Application string
++	Run         string
++	Template    string
++	// Items describe each authorization detail; Details is their exact JSON.
++	Items    []string
++	Details  string
++	GrantTTL string
++	TokenTTL string
++	PlanID   string
++	ReqPath  string
++}
++
++// HasDelegation reports whether the frontend has the delegation template.
++func (t *Templates) HasDelegation() bool { return t.delegationTmpl != nil }
++
++// Delegation renders the consent screen of an Authorization Plan.
++func (t *Templates) Delegation(r *http.Request, w http.ResponseWriter, page DelegationPage) error {
++	if t.delegationTmpl == nil {
++		return fmt.Errorf("missing template %s", tmplDelegation)
++	}
++	page.ReqPath = r.URL.Path
++	return renderTemplate(w, t.delegationTmpl, page)
++}
++
+ func (t *Templates) TOTPVerify(r *http.Request, w http.ResponseWriter, postURL, issuer, connector, qrCode string, lastWasInvalid bool) error {
+ 	if lastWasInvalid {
+ 		w.WriteHeader(http.StatusUnauthorized)
+diff --git a/server/tokens/authorization.go b/server/tokens/authorization.go
+index 3851026..6ec1af1 100644
+--- a/server/tokens/authorization.go
++++ b/server/tokens/authorization.go
+@@ -45,6 +45,9 @@ type Response struct {
+ 	RefreshToken    string `json:"refresh_token,omitempty"`
+ 	IDToken         string `json:"id_token,omitempty"`
+ 	Scope           string `json:"scope,omitempty"`
++	// AuthorizationDetails are the RAR details the token carries (RFC 9396
++	// §7), for PathOps delegation.
++	AuthorizationDetails json.RawMessage `json:"authorization_details,omitempty"`
+ }
+ 
+ // Response renders the token set as an OAuth2 token response as of now, filling
+diff --git a/storage/kubernetes/delegation_test.go b/storage/kubernetes/delegation_test.go
+new file mode 100644
+index 0000000..a76dc33
+--- /dev/null
++++ b/storage/kubernetes/delegation_test.go
+@@ -0,0 +1,24 @@
++package kubernetes
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/require"
++
++	"github.com/dexidp/dex/storage"
++)
++
++// The PathOps delegation state survives the Kubernetes representation of
++// auth requests and auth codes.
++func TestDelegationFieldRoundTrip(t *testing.T) {
++	cli := &client{apiVersion: "dex.coreos.com/v1", namespace: "identity"}
++	state := []byte(`{"plan":{"id":"plan-1"}}`)
++
++	req := cli.fromStorageAuthRequest(storage.AuthRequest{ID: "req", ClientID: "c", Delegation: state})
++	require.Equal(t, state, toStorageAuthRequest(req).Delegation)
++
++	code := cli.fromStorageAuthCode(storage.AuthCode{ID: "code", ClientID: "c", Delegation: state})
++	require.Equal(t, state, toStorageAuthCode(code).Delegation)
++
++	require.Nil(t, toStorageAuthRequest(cli.fromStorageAuthRequest(storage.AuthRequest{ID: "plain"})).Delegation)
++}
+diff --git a/storage/kubernetes/types.go b/storage/kubernetes/types.go
+index 151c8ad..d0343d9 100644
+--- a/storage/kubernetes/types.go
++++ b/storage/kubernetes/types.go
+@@ -424,6 +424,8 @@ type AuthRequest struct {
+ 	Prompt   string    `json:"prompt,omitempty"`
+ 	MaxAge   int       `json:"maxAge"`
+ 	AuthTime time.Time `json:"authTime,omitempty"`
++
++	Delegation []byte `json:"delegation,omitempty"`
+ }
+ 
+ // AuthRequestList is a list of AuthRequests.
+@@ -458,6 +460,7 @@ func toStorageAuthRequest(req AuthRequest) storage.AuthRequest {
+ 		Prompt:              req.Prompt,
+ 		MaxAge:              req.MaxAge,
+ 		AuthTime:            req.AuthTime,
++		Delegation:          req.Delegation,
+ 	}
+ 	return a
+ }
+@@ -492,6 +495,7 @@ func (cli *client) fromStorageAuthRequest(a storage.AuthRequest) AuthRequest {
+ 		Prompt:              a.Prompt,
+ 		MaxAge:              a.MaxAge,
+ 		AuthTime:            a.AuthTime,
++		Delegation:          a.Delegation,
+ 	}
+ 	return req
+ }
+@@ -584,6 +588,8 @@ type AuthCode struct {
+ 	AuthTime time.Time `json:"authTime,omitempty"`
+ 
+ 	SessionID string `json:"sessionID,omitempty"`
++
++	Delegation []byte `json:"delegation,omitempty"`
+ }
+ 
+ // AuthCodeList is a list of AuthCodes.
+@@ -615,6 +621,7 @@ func (cli *client) fromStorageAuthCode(a storage.AuthCode) AuthCode {
+ 		CodeChallengeMethod: a.PKCE.CodeChallengeMethod,
+ 		AuthTime:            a.AuthTime,
+ 		SessionID:           a.SessionID,
++		Delegation:          a.Delegation,
+ 	}
+ }
+ 
+@@ -633,8 +640,9 @@ func toStorageAuthCode(a AuthCode) storage.AuthCode {
+ 			CodeChallenge:       a.CodeChallenge,
+ 			CodeChallengeMethod: a.CodeChallengeMethod,
+ 		},
+-		AuthTime:  a.AuthTime,
+-		SessionID: a.SessionID,
++		AuthTime:   a.AuthTime,
++		SessionID:  a.SessionID,
++		Delegation: a.Delegation,
+ 	}
+ }
+ 
+diff --git a/storage/storage.go b/storage/storage.go
+index 84976c5..f1964f5 100644
+--- a/storage/storage.go
++++ b/storage/storage.go
+@@ -341,6 +341,11 @@ type AuthRequest struct {
+ 	// WebAuthnSessionData stores temporary WebAuthn ceremony data (challenge, etc.)
+ 	// between Begin and Finish calls. JSON-encoded webauthn.SessionData.
+ 	WebAuthnSessionData []byte
++
++	// Delegation is the PathOps operation-scoped delegation state of a request
++	// started from a pushed Authorization Plan (server/delegation), JSON. Empty
++	// for every other request. Kept by the kubernetes and memory storages only.
++	Delegation []byte
+ }
+ 
+ // AuthCode represents a code which can be exchanged for an OAuth2 token response.
+@@ -388,6 +393,10 @@ type AuthCode struct {
+ 
+ 	// PKCE CodeChallenge and CodeChallengeMethod
+ 	PKCE PKCE
++
++	// Delegation is the delegation state of the AuthRequest this code was
++	// issued from (see AuthRequest.Delegation).
++	Delegation []byte
+ }
+ 
+ // RefreshToken is an OAuth2 refresh token which allows a client to request new
+diff --git a/web/templates/delegation.html b/web/templates/delegation.html
+new file mode 100644
+index 0000000..2e6a525
+--- /dev/null
++++ b/web/templates/delegation.html
+@@ -0,0 +1,55 @@
++{{ template "header.html" . }}
++
++<div class="theme-panel">
++  <h2 class="theme-heading">Approve an operation</h2>
++
++  <hr class="dex-separator">
++  <div>
++    <div class="dex-subtle-text">
++      <strong>{{ .Delegate }}</strong> asks to act as <strong>{{ .User }}</strong> for this operation only:
++    </div>
++    <p id="pathops-operation"><strong>{{ .Operation }}</strong> &mdash; Application <strong>{{ .Application }}</strong></p>
++    <ul class="dex-list" id="pathops-authorization-details">
++      {{ range $item := .Items }}
++      <li>{{ $item }}</li>
++      {{ end }}
++    </ul>
++    <div class="dex-subtle-text">
++      Template {{ .Template }}. Run {{ .Run }}.
++    </div>
++    <div class="dex-subtle-text">
++      This approval covers only the resources listed above and expires {{ .GrantTTL }} after you approve.
++      Each tool credential derived from it lasts at most {{ .TokenTTL }}, has no refresh token and carries only
++      the part of this list its step needs. Another operation needs another approval.
++    </div>
++    <details>
++      <summary class="dex-subtle-text">Exact authorization details (plan {{ .PlanID }})</summary>
++      <pre id="pathops-authorization-details-json" style="white-space: pre-wrap; word-break: break-all;">{{ .Details }}</pre>
++    </details>
++  </div>
++  <hr class="dex-separator">
++
++  <div>
++    <div class="theme-form-row">
++      <form method="post">
++        <input type="hidden" name="req" value="{{ .AuthReqID }}"/>
++        <input type="hidden" name="approval" value="approve">
++        <button type="submit" id="pathops-approve" class="dex-btn theme-btn--success">
++            <span class="dex-btn-text">Approve</span>
++        </button>
++      </form>
++    </div>
++    <div class="theme-form-row">
++      <form method="post">
++        <input type="hidden" name="req" value="{{ .AuthReqID }}"/>
++        <input type="hidden" name="approval" value="rejected">
++        <button type="submit" id="pathops-reject" class="dex-btn theme-btn-provider">
++            <span class="dex-btn-text">Reject</span>
++        </button>
++      </form>
++    </div>
++  </div>
++
++</div>
++
++{{ template "footer.html" . }}
+-- 
+2.53.0
+
