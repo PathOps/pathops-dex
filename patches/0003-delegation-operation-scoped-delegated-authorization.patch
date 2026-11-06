@@ -1,4 +1,4 @@
-From f6d7a23fbd05ace7076ffa84f304d1d1446cb250 Mon Sep 17 00:00:00 2001
+From 62f22bf64e6785ca0ff0d7439aaf0d2e2f574342 Mon Sep 17 00:00:00 2001
 From: PathOps <noreply@pathops.dev>
 Date: Fri, 6 Nov 2026 03:56:00 -0300
 Subject: [PATCH] delegation: operation-scoped delegated authorization (PAR,
@@ -17,8 +17,10 @@ delegated authorization (PathOps Decision 0050):
 - authorization_details and the plan are refused on the front channel;
 - a per-operation consent screen (delegation.html) that skipApprovalScreen,
   stored consents and login sessions never bypass; the authenticated user
-  must be the plan's subject. It lists repositories and webhooks with their
-  actions, the operation, and the exact details as indented JSON;
+  must be the plan's subject. It groups the resources by tool, each headed
+  by the tool's display name, canonical URL and optional icon from the
+  configuration (never from the plan), lists repositories and webhooks with
+  their actions, the operation, and the exact details as indented JSON;
 - an operation grant stored in the user's UserIdentity (reserved Consents
   key), approved on consent and activated only when the code is redeemed
   with the plan's PKCE verifier;
@@ -55,19 +57,19 @@ Without the configuration, behavior is unchanged.
  server/consent/consent.go             | 128 +++++
  server/delegation/authorization.go    | 101 ++++
  server/delegation/canonical.go        | 171 ++++++
- server/delegation/delegation.go       | 304 +++++++++++
- server/delegation/delegation_test.go  |  60 +++
+ server/delegation/delegation.go       | 338 ++++++++++++
+ server/delegation/delegation_test.go  | 104 ++++
  server/delegation/derive.go           |  84 +++
  server/delegation/flow.go             |  40 ++
  server/delegation/grant.go            | 223 ++++++++
- server/delegation/plan.go             | 445 ++++++++++++++++
+ server/delegation/plan.go             | 469 +++++++++++++++++
  server/discovery/discovery.go         |  11 +
  server/grants/authcode.go             |  43 ++
  server/grants/delegation.go           |  76 +++
  server/grants/grants.go               |  24 +-
  server/introspection/introspection.go |   5 +
  server/server.go                      |  14 +
- server/server_delegation_test.go      | 724 ++++++++++++++++++++++++++
+ server/server_delegation_test.go      | 729 ++++++++++++++++++++++++++
  server/signer/local.go                |   8 +-
  server/signer/mock.go                 |   4 +
  server/signer/signer.go               |   7 +
@@ -78,8 +80,8 @@ Without the configuration, behavior is unchanged.
  storage/kubernetes/delegation_test.go |  24 +
  storage/kubernetes/types.go           |  12 +-
  storage/storage.go                    |   9 +
- web/templates/delegation.html         | 138 +++++
- 36 files changed, 2961 insertions(+), 7 deletions(-)
+ web/templates/delegation.html         | 159 ++++++
+ 36 files changed, 3089 insertions(+), 7 deletions(-)
  create mode 100644 server/authflow/par.go
  create mode 100644 server/delegation/authorization.go
  create mode 100644 server/delegation/canonical.go
@@ -958,10 +960,10 @@ index 0000000..5fad134
 +}
 diff --git a/server/delegation/delegation.go b/server/delegation/delegation.go
 new file mode 100644
-index 0000000..e7f0b12
+index 0000000..183f788
 --- /dev/null
 +++ b/server/delegation/delegation.go
-@@ -0,0 +1,304 @@
+@@ -0,0 +1,338 @@
 +// Package delegation is the PathOps extension for operation-scoped human
 +// delegated authorization (PathOps Decision 0050).
 +//
@@ -1005,8 +1007,10 @@ index 0000000..e7f0b12
 +	"encoding/base64"
 +	"errors"
 +	"fmt"
++	"net/url"
 +	"regexp"
 +	"slices"
++	"strings"
 +	"time"
 +)
 +
@@ -1074,6 +1078,13 @@ index 0000000..e7f0b12
 +	Name string `json:"name"`
 +	// DisplayName is shown on the consent screen (default Name).
 +	DisplayName string `json:"displayName"`
++	// URL is the tool's canonical https URL (e.g. the Cell's Forgejo): the
++	// consent screen shows it so the user knows which server the approval is
++	// for. It comes from this configuration, never from a plan.
++	URL string `json:"url"`
++	// IconURL optionally names an https image the consent screen shows next
++	// to the tool's name (the name alone when it does not load).
++	IconURL string `json:"iconURL"`
 +	// AudiencePattern is a regular expression a plan's audience for this tool
 +	// must match entirely.
 +	AudiencePattern string `json:"audiencePattern"`
@@ -1101,6 +1112,7 @@ index 0000000..e7f0b12
 +
 +type tool struct {
 +	name, display string
++	url, icon     string
 +	audience      *regexp.Regexp
 +	types         map[string]bool
 +}
@@ -1207,7 +1219,15 @@ index 0000000..e7f0b12
 +		if tc.AudiencePattern == "" || err != nil {
 +			return nil, fmt.Errorf("delegation.delegates[%s].tools[%s].audiencePattern: %v", c.Client, tc.Name, err)
 +		}
-+		t := &tool{name: tc.Name, display: tc.DisplayName, audience: re, types: map[string]bool{}}
++		if err := httpsURL(tc.URL); err != nil {
++			return nil, fmt.Errorf("delegation.delegates[%s].tools[%s].url: %v", c.Client, tc.Name, err)
++		}
++		if tc.IconURL != "" {
++			if err := httpsURL(tc.IconURL); err != nil {
++				return nil, fmt.Errorf("delegation.delegates[%s].tools[%s].iconURL: %v", c.Client, tc.Name, err)
++			}
++		}
++		t := &tool{name: tc.Name, display: tc.DisplayName, url: tc.URL, icon: tc.IconURL, audience: re, types: map[string]bool{}}
 +		if t.display == "" {
 +			t.display = tc.Name
 +		}
@@ -1223,6 +1243,22 @@ index 0000000..e7f0b12
 +		d.tools[tc.Name] = t
 +	}
 +	return d, nil
++}
++
++// httpsURL checks a configured https URL: absolute, with a host, without
++// credentials, query or fragment.
++func httpsURL(raw string) error {
++	u, err := url.Parse(raw)
++	switch {
++	case raw == "":
++		return errors.New("is empty")
++	case err != nil:
++		return fmt.Errorf("%q is not a URL", raw)
++	case u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" ||
++		strings.ContainsAny(raw, "?# \t\n"):
++		return fmt.Errorf("%q is not an https URL without credentials, query or fragment", raw)
++	}
++	return nil
 +}
 +
 +// PlanClient reports whether clientID may push plans.
@@ -1268,10 +1304,10 @@ index 0000000..e7f0b12
 +func (p *Policy) TokensValidFor() time.Duration { return p.tokenTTL }
 diff --git a/server/delegation/delegation_test.go b/server/delegation/delegation_test.go
 new file mode 100644
-index 0000000..3fdb2a4
+index 0000000..4d4468e
 --- /dev/null
 +++ b/server/delegation/delegation_test.go
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,104 @@
 +package delegation
 +
 +import (
@@ -1288,7 +1324,8 @@ index 0000000..3fdb2a4
 +		Delegates: []DelegateConfig{{
 +			Client: "pathops-tenant-control-plane", PlanIssuer: "https://tcp.example",
 +			PlanKeys: []KeyConfig{{KeyID: "k1", Ed25519: base64.RawURLEncoding.EncodeToString(make([]byte, 32))}},
-+			Tools:    []ToolConfig{{Name: "forgejo", AudiencePattern: `u:[0-9]+:[0-9a-f-]{36}`, DetailTypes: []string{"pathops_repository"}}},
++			Tools: []ToolConfig{{Name: "forgejo", URL: "https://forgejo-c1.example", AudiencePattern: `u:[0-9]+:[0-9a-f-]{36}`,
++				DetailTypes: []string{"pathops_repository"}}},
 +		}},
 +	}
 +}
@@ -1311,6 +1348,13 @@ index 0000000..3fdb2a4
 +		"no tools":                func(c *Config) { c.Delegates[0].Tools = nil },
 +		"no audience pattern":     func(c *Config) { c.Delegates[0].Tools[0].AudiencePattern = "" },
 +		"no detail types":         func(c *Config) { c.Delegates[0].Tools[0].DetailTypes = nil },
++		"no tool url":             func(c *Config) { c.Delegates[0].Tools[0].URL = "" },
++		"http tool url":           func(c *Config) { c.Delegates[0].Tools[0].URL = "http://forgejo-c1.example" },
++		"relative tool url":       func(c *Config) { c.Delegates[0].Tools[0].URL = "forgejo-c1.example" },
++		"tool url credentials":    func(c *Config) { c.Delegates[0].Tools[0].URL = "https://u:p@forgejo-c1.example" },
++		"tool url query":          func(c *Config) { c.Delegates[0].Tools[0].URL = "https://forgejo-c1.example/?x=1" },
++		"http icon":               func(c *Config) { c.Delegates[0].Tools[0].IconURL = "http://forgejo-c1.example/logo.svg" },
++		"icon fragment":           func(c *Config) { c.Delegates[0].Tools[0].IconURL = "https://forgejo-c1.example/logo.svg#x" },
 +		"token outlives grant":    func(c *Config) { c.GrantsValidFor, c.TokensValidFor = "1m", "5m" },
 +		"grant over a day":        func(c *Config) { c.GrantsValidFor = "48h" },
 +		"bad duration":            func(c *Config) { c.TokensValidFor = "soon" },
@@ -1331,6 +1375,42 @@ index 0000000..3fdb2a4
 +	require.True(t, re.MatchString("u:7:2f0c6a51-8d7e-4b8e-9c55-3a2f0e9b1c44"))
 +	require.False(t, re.MatchString("x u:7:2f0c6a51-8d7e-4b8e-9c55-3a2f0e9b1c44"))
 +	require.False(t, re.MatchString("u:7:2f0c6a51-8d7e-4b8e-9c55-3a2f0e9b1c44"+strings.Repeat("0", 1)))
++}
++
++// TestConsentGroupsByTool: the consent account groups details by tool and
++// names each tool by its configuration (display name, URL, icon), never by
++// the plan.
++func TestConsentGroupsByTool(t *testing.T) {
++	c := validConfig()
++	c.Delegates[0].Tools[0].DisplayName = "Forgejo"
++	c.Delegates[0].Tools[0].IconURL = "https://forgejo-c1.example/assets/img/logo.svg"
++	c.Delegates[0].Tools[0].DetailTypes = []string{"pathops_repository", "pathops_webhook"}
++	p, err := NewPolicy(c)
++	require.NoError(t, err)
++	pl := &Plan{Delegate: "pathops-tenant-control-plane", Details: []byte(`[
++		{"type":"pathops_repository","tool":"forgejo","owner":"o","repository":"a","actions":["create","seed"]},
++		{"type":"pathops_webhook","tool":"forgejo","owner":"o","repository":"a","events":["push"],
++		 "url":"https://control-plane-c1.example/api/v1/webhooks/forgejo/x","actions":["configure"]},
++		{"type":"pathops_repository","tool":"forgejo","owner":"o","repository":"b","actions":["create"]}]`)}
++	got := p.Consent(pl)
++	require.Len(t, got.Tools, 1)
++	tool := got.Tools[0]
++	require.Equal(t, "forgejo", tool.Name)
++	require.Equal(t, "Forgejo", tool.DisplayName)
++	require.Equal(t, "https://forgejo-c1.example", tool.URL)
++	require.Equal(t, "https://forgejo-c1.example/assets/img/logo.svg", tool.IconURL)
++	require.Len(t, tool.Repositories, 2)
++	require.Equal(t, "o/a", tool.Repositories[0].Name)
++	require.Equal(t, "o/b", tool.Repositories[1].Name)
++	require.Len(t, tool.Webhooks, 1)
++	require.Equal(t, "https://control-plane-c1.example/api/v1/webhooks/forgejo/x", tool.Webhooks[0].URL)
++	require.Equal(t, []string{"push"}, tool.Webhooks[0].Events)
++
++	// A tool the configuration does not know has no URL or icon to show.
++	unknown := p.Consent(&Plan{Delegate: "pathops-tenant-control-plane",
++		Details: []byte(`[{"type":"x_thing","tool":"elsewhere","actions":["read"]}]`)})
++	require.Len(t, unknown.Tools, 1)
++	require.Equal(t, ConsentTool{Name: "elsewhere", DisplayName: "elsewhere", Other: []string{"x_thing read"}}, unknown.Tools[0])
 +}
 diff --git a/server/delegation/derive.go b/server/delegation/derive.go
 new file mode 100644
@@ -1699,10 +1779,10 @@ index 0000000..850437b
 +}
 diff --git a/server/delegation/plan.go b/server/delegation/plan.go
 new file mode 100644
-index 0000000..f768188
+index 0000000..b560be1
 --- /dev/null
 +++ b/server/delegation/plan.go
-@@ -0,0 +1,445 @@
+@@ -0,0 +1,469 @@
 +package delegation
 +
 +import (
@@ -2039,9 +2119,21 @@ index 0000000..f768188
 +	return c, toolName, nil
 +}
 +
-+// Consent is the consent screen's account of a plan's details: what each
-+// tool resource is and which actions the user grants on it.
++// Consent is the consent screen's account of a plan's details, grouped by
++// tool: which server each group is for and, on it, what each resource is and
++// which actions the user grants.
 +type Consent struct {
++	Tools []ConsentTool
++}
++
++// ConsentTool is one tool of a plan. Its name, URL and icon come from the
++// delegation configuration (the operator's), never from the plan, so a
++// delegate cannot present a tool as another server.
++type ConsentTool struct {
++	Name, DisplayName string
++	// URL is the tool's canonical URL; IconURL is optional. Both are empty
++	// for a tool missing from the configuration.
++	URL, IconURL string
 +	Repositories []ConsentRepository
 +	Webhooks     []ConsentWebhook
 +	// Other are details of other types, described generically.
@@ -2050,17 +2142,17 @@ index 0000000..f768188
 +
 +// ConsentRepository is one repository detail.
 +type ConsentRepository struct {
-+	Tool, Name string
-+	Actions    []ConsentAction
++	Name    string
++	Actions []ConsentAction
 +	// Summary says what the actions do, in a sentence.
 +	Summary string
 +}
 +
 +// ConsentWebhook is one webhook detail.
 +type ConsentWebhook struct {
-+	Tool, Repository, URL string
-+	Events                []string
-+	Actions               []ConsentAction
++	Repository, URL string
++	Events          []string
++	Actions         []ConsentAction
 +}
 +
 +// ConsentAction is an action and what it means.
@@ -2086,20 +2178,32 @@ index 0000000..f768188
 +	return out
 +}
 +
-+// Consent describes pl's details for the consent screen, in plan order.
++// Consent describes pl's details for the consent screen: tools in the order
++// they first appear, details in plan order within each.
 +func (p *Policy) Consent(pl *Plan) Consent {
 +	d := p.delegates[pl.Delegate]
 +	els, _ := elements(pl.Details)
 +	var c Consent
++	group := func(name string) *ConsentTool {
++		for i := range c.Tools {
++			if c.Tools[i].Name == name {
++				return &c.Tools[i]
++			}
++		}
++		ct := ConsentTool{Name: name, DisplayName: name}
++		if d != nil && d.tools[name] != nil {
++			t := d.tools[name]
++			ct.DisplayName, ct.URL, ct.IconURL = t.display, t.url, t.icon
++		}
++		c.Tools = append(c.Tools, ct)
++		return &c.Tools[len(c.Tools)-1]
++	}
 +	for _, el := range els {
 +		var m map[string]any
 +		_ = json.Unmarshal(el, &m)
 +		var dt detail
 +		_ = json.Unmarshal(el, &dt)
-+		display := dt.Tool
-+		if d != nil && d.tools[dt.Tool] != nil {
-+			display = d.tools[dt.Tool].display
-+		}
++		t := group(dt.Tool)
 +		str := func(k string) string { s, _ := m[k].(string); return s }
 +		repo := str("owner") + "/" + str("repository")
 +		switch dt.Type {
@@ -2113,12 +2217,12 @@ index 0000000..f768188
 +			if summary != "" {
 +				summary = strings.ToUpper(summary[:1]) + summary[1:] + "."
 +			}
-+			c.Repositories = append(c.Repositories, ConsentRepository{Tool: display, Name: repo, Actions: actions, Summary: summary})
++			t.Repositories = append(t.Repositories, ConsentRepository{Name: repo, Actions: actions, Summary: summary})
 +		case "pathops_webhook":
-+			c.Webhooks = append(c.Webhooks, ConsentWebhook{Tool: display, Repository: repo, URL: str("url"),
++			t.Webhooks = append(t.Webhooks, ConsentWebhook{Repository: repo, URL: str("url"),
 +				Events: eventList(m["events"]), Actions: consentActions(dt.Actions)})
 +		default:
-+			c.Other = append(c.Other, display+": "+describe(dt, m))
++			t.Other = append(t.Other, describe(dt, m))
 +		}
 +	}
 +	return c
@@ -2499,10 +2603,10 @@ index 6433b61..4985756 100644
  			Storage:     s.storage,
 diff --git a/server/server_delegation_test.go b/server/server_delegation_test.go
 new file mode 100644
-index 0000000..ea81d73
+index 0000000..92f588d
 --- /dev/null
 +++ b/server/server_delegation_test.go
-@@ -0,0 +1,724 @@
+@@ -0,0 +1,729 @@
 +package server
 +
 +import (
@@ -2536,7 +2640,8 @@ index 0000000..ea81d73
 +	dlgPlanIssuer  = "https://tcp.example.test"
 +	dlgAudience    = "u:7:2f0c6a51-8d7e-4b8e-9c55-3a2f0e9b1c44"
 +	dlgMockUserID  = "0-385-28089-0"
-+	dlgWebhookBase = "http://tenant-control-plane.pathops.svc:8080/api/v1/webhooks/forgejo/"
++	dlgWebhookBase = "https://control-plane-test.example/api/v1/webhooks/forgejo/"
++	dlgForgejoURL  = "https://forgejo-test.example"
 +)
 +
 +type dlgEnv struct {
@@ -2569,7 +2674,7 @@ index 0000000..ea81d73
 +			Delegates: []delegation.DelegateConfig{{
 +				Client: dlgTCP, Name: "PathOps Tenant Control Plane (test)", PlanIssuer: dlgPlanIssuer,
 +				PlanKeys: []delegation.KeyConfig{{KeyID: "plan-1", Ed25519: base64.RawURLEncoding.EncodeToString(pub)}},
-+				Tools: []delegation.ToolConfig{{Name: "forgejo", DisplayName: "Forgejo",
++				Tools: []delegation.ToolConfig{{Name: "forgejo", DisplayName: "Forgejo", URL: dlgForgejoURL, IconURL: dlgForgejoURL + "/assets/img/logo.svg",
 +					AudiencePattern: `u:[0-9]+:[0-9a-f-]{36}`, DetailTypes: []string{"pathops_repository", "pathops_webhook"}}},
 +			}},
 +		})
@@ -2862,6 +2967,10 @@ index 0000000..ea81d73
 +	page, approval := e.consent(e.requestURI(plan, raw, pk))
 +	for _, want := range []string{"PathOps Tenant Control Plane (test)", "Create an application: <code>app-a</code>",
 +		"<code>CREATE_APPLICATION</code>", "<h3>Repositories</h3>", "<h3>Webhook</h3>",
++		`<section class="pc-tool-group" data-tool="forgejo">`, `<p class="pc-tool-name">Forgejo</p>`,
++		`<a href="` + dlgForgejoURL + `" target="_blank" rel="noopener noreferrer"><code>` + dlgForgejoURL + `</code></a>`,
++		`<img class="pc-tool-icon" src="` + dlgForgejoURL + `/assets/img/logo.svg" alt=""`, `referrerpolicy="no-referrer"`,
++		"This Cell's Forgejo: the approval applies only to this server.",
 +		`<code class="pc-name">kilgore/app-a</code>`, `<code class="pc-name">kilgore/app-a-gitops-preflight</code>`,
 +		`<code class="pc-name">kilgore/app-a-gitops-production</code>`,
 +		`<span class="pc-chip" title="create it as a private repository">create</span>`,
@@ -3541,10 +3650,10 @@ index 84976c5..f1964f5 100644
  // RefreshToken is an OAuth2 refresh token which allows a client to request new
 diff --git a/web/templates/delegation.html b/web/templates/delegation.html
 new file mode 100644
-index 0000000..25dbb70
+index 0000000..9379175
 --- /dev/null
 +++ b/web/templates/delegation.html
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,159 @@
 +{{ template "header.html" . }}
 +
 +<style>
@@ -3562,6 +3671,15 @@ index 0000000..25dbb70
 +  .pathops-consent .pc-item { border: 1px solid rgba(127, 127, 127, .3); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
 +  .pathops-consent .pc-item-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
 +  .pathops-consent .pc-tool { font-size: 12px; opacity: .7; }
++  .pathops-consent .pc-tool-group { border: 1px solid rgba(127, 127, 127, .35); border-radius: 10px; padding: 14px 16px 4px; margin: 0 0 20px; }
++  .pathops-consent .pc-tool-head { display: flex; align-items: flex-start; gap: 12px; margin: 0 0 14px; }
++  .pathops-consent .pc-tool-icon { width: 32px; height: 32px; flex: none; }
++  .pathops-consent .pc-tool-id { min-width: 0; }
++  .pathops-consent .pc-tool-id p { margin: 0; }
++  .pathops-consent .pc-tool-name { font-size: 16px; font-weight: 600; }
++  .pathops-consent .pc-tool-url { overflow-wrap: anywhere; }
++  .pathops-consent .pc-tool-url a { color: inherit; }
++  .pathops-consent .pc-tool-note { font-size: 13px; opacity: .8; }
 +  .pathops-consent code, .pathops-consent pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
 +  .pathops-consent .pc-name { font-weight: 600; overflow-wrap: anywhere; }
 +  .pathops-consent .pc-chips { display: inline-flex; flex-wrap: wrap; gap: 4px; }
@@ -3595,48 +3713,60 @@ index 0000000..25dbb70
 +  </p>
 +
 +  <div id="pathops-authorization-details">
-+    {{ with .Consent.Repositories }}
-+    <section class="pc-section">
-+      <h3>Repositories</h3>
-+      <ul class="pc-list">
-+        {{ range . }}
-+        <li class="pc-item">
-+          <div class="pc-item-head">
-+            <code class="pc-name">{{ .Name }}</code>
-+            <span class="pc-chips">{{ range .Actions }}<span class="pc-chip" title="{{ .Meaning }}">{{ .Name }}</span>{{ end }}</span>
-+            <span class="pc-tool">{{ .Tool }}</span>
-+          </div>
-+          <p class="pc-note">{{ .Summary }}</p>
-+        </li>
-+        {{ end }}
-+      </ul>
-+    </section>
-+    {{ end }}
++    {{ range .Consent.Tools }}
++    <section class="pc-tool-group" data-tool="{{ .Name }}">
++      <header class="pc-tool-head">
++        {{ with .IconURL }}<img class="pc-tool-icon" src="{{ . }}" alt="" width="32" height="32" referrerpolicy="no-referrer" onerror="this.hidden=true">{{ end }}
++        <div class="pc-tool-id">
++          <p class="pc-tool-name">{{ .DisplayName }}</p>
++          {{ with .URL }}<p class="pc-tool-url"><a href="{{ . }}" target="_blank" rel="noopener noreferrer"><code>{{ . }}</code></a></p>{{ end }}
++          <p class="pc-tool-note">{{ if .URL }}This Cell's {{ .DisplayName }}: the approval applies only to this server.{{ else }}A tool without a configured URL.{{ end }}</p>
++        </div>
++      </header>
 +
-+    {{ with .Consent.Webhooks }}
-+    <section class="pc-section">
-+      <h3>{{ if gt (len .) 1 }}Webhooks{{ else }}Webhook{{ end }}</h3>
-+      <ul class="pc-list">
-+        {{ range . }}
-+        <li class="pc-item">
-+          <dl class="pc-facts">
-+            <dt>Repository</dt><dd><code class="pc-name">{{ .Repository }}</code> <span class="pc-tool">{{ .Tool }}</span></dd>
-+            <dt>Events</dt><dd><span class="pc-chips">{{ range .Events }}<span class="pc-chip">{{ . }}</span>{{ end }}</span></dd>
-+            <dt>Destination</dt><dd><code>{{ .URL }}</code></dd>
-+            <dt>Actions</dt><dd><span class="pc-chips">{{ range .Actions }}<span class="pc-chip" title="{{ .Meaning }}">{{ .Name }}</span>{{ end }}</span></dd>
-+          </dl>
-+        </li>
-+        {{ end }}
-+      </ul>
-+    </section>
-+    {{ end }}
++      {{ with .Repositories }}
++      <div class="pc-section">
++        <h3>Repositories</h3>
++        <ul class="pc-list">
++          {{ range . }}
++          <li class="pc-item">
++            <div class="pc-item-head">
++              <code class="pc-name">{{ .Name }}</code>
++              <span class="pc-chips">{{ range .Actions }}<span class="pc-chip" title="{{ .Meaning }}">{{ .Name }}</span>{{ end }}</span>
++            </div>
++            <p class="pc-note">{{ .Summary }}</p>
++          </li>
++          {{ end }}
++        </ul>
++      </div>
++      {{ end }}
 +
-+    {{ with .Consent.Other }}
-+    <section class="pc-section">
-+      <h3>Other resources</h3>
-+      <ul class="pc-list">
-+        {{ range . }}<li class="pc-item">{{ . }}</li>{{ end }}
-+      </ul>
++      {{ with .Webhooks }}
++      <div class="pc-section">
++        <h3>{{ if gt (len .) 1 }}Webhooks{{ else }}Webhook{{ end }}</h3>
++        <ul class="pc-list">
++          {{ range . }}
++          <li class="pc-item">
++            <dl class="pc-facts">
++              <dt>Repository</dt><dd><code class="pc-name">{{ .Repository }}</code></dd>
++              <dt>Events</dt><dd><span class="pc-chips">{{ range .Events }}<span class="pc-chip">{{ . }}</span>{{ end }}</span></dd>
++              <dt>Destination</dt><dd><code>{{ .URL }}</code></dd>
++              <dt>Actions</dt><dd><span class="pc-chips">{{ range .Actions }}<span class="pc-chip" title="{{ .Meaning }}">{{ .Name }}</span>{{ end }}</span></dd>
++            </dl>
++          </li>
++          {{ end }}
++        </ul>
++      </div>
++      {{ end }}
++
++      {{ with .Other }}
++      <div class="pc-section">
++        <h3>Other resources</h3>
++        <ul class="pc-list">
++          {{ range . }}<li class="pc-item">{{ . }}</li>{{ end }}
++        </ul>
++      </div>
++      {{ end }}
 +    </section>
 +    {{ end }}
 +  </div>

@@ -87,9 +87,18 @@ delegation:
       tools:
         - name: forgejo
           displayName: Forgejo
+          url: https://forgejo.example.org                       # canonical URL, shown on the consent screen
+          iconURL: https://forgejo.example.org/assets/img/logo.svg  # optional
           audiencePattern: 'u:[0-9]+:[0-9a-f-]{36}'
           detailTypes: [pathops_repository, pathops_webhook]
 ```
+
+Each tool needs a canonical `url` (https, no credentials, query or
+fragment). `iconURL` is optional (https). The consent screen groups the
+plan's resources by tool and heads each group with the tool's icon, display
+name and URL, all taken from this configuration and never from a plan, so a
+delegate cannot present one tool as another server. If the icon does not
+load, the name alone is shown; the image is fetched without a referrer.
 
 Flow:
 

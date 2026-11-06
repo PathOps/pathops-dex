@@ -38,10 +38,10 @@ grep -q -- '--- PASS: TestSessionCookieKeyFromEnv ' <<< "$out" \
   || { echo "test: TestSessionCookieKeyFromEnv did not run and pass" >&2; exit 1; }
 
 echo "test: PathOps delegation tests"
-out=$(go test ./server/ ./server/delegation/ ./storage/kubernetes/ -count=1 -run 'Delegation|NewPolicy|AudiencePattern' -v)
+out=$(go test ./server/ ./server/delegation/ ./storage/kubernetes/ -count=1 -run 'Delegation|NewPolicy|AudiencePattern|Consent' -v)
 echo "$out" | grep -E -- '^--- (PASS|FAIL)'
 for t in TestDelegationFlow TestDelegationOperationsAreSeparate TestDelegationPushedRequestChecks TestDelegationConsent TestDelegationSessions \
-  TestDelegationCanonical TestNewPolicy TestDelegationFieldRoundTrip; do
+  TestDelegationCanonical TestNewPolicy TestConsentGroupsByTool TestDelegationFieldRoundTrip; do
   grep -q -- "--- PASS: $t " <<< "$out" || { echo "test: $t did not run and pass" >&2; exit 1; }
 done
 
