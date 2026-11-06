@@ -1,6 +1,6 @@
-From 165b483b610de250bf662b1043dbc299e765b90a Mon Sep 17 00:00:00 2001
+From f6d7a23fbd05ace7076ffa84f304d1d1446cb250 Mon Sep 17 00:00:00 2001
 From: PathOps <noreply@pathops.dev>
-Date: Tue, 3 Nov 2026 09:10:35 -0300
+Date: Fri, 6 Nov 2026 03:56:00 -0300
 Subject: [PATCH] delegation: operation-scoped delegated authorization (PAR,
  RAR, signed plans)
 
@@ -15,13 +15,23 @@ delegated authorization (PathOps Decision 0050):
   signature and requires the pushed details to equal the plan's in canonical
   JSON; request_uri values are short-lived and single-use;
 - authorization_details and the plan are refused on the front channel;
-- a per-operation consent screen (delegation.html) that skipApprovalScreen
-  and stored consents never bypass; the authenticated user must be the
-  plan's subject;
+- a per-operation consent screen (delegation.html) that skipApprovalScreen,
+  stored consents and login sessions never bypass; the authenticated user
+  must be the plan's subject. It lists repositories and webhooks with their
+  actions, the operation, and the exact details as indented JSON;
 - an operation grant stored in the user's UserIdentity (reserved Consents
   key), approved on consent and activated only when the code is redeemed
-  with the plan's PKCE verifier; the code response carries the approved
-  authorization_details;
+  with the plan's PKCE verifier;
+- that code response carries only an Operation Authorization Token (and the
+  approved authorization_details): a JWT with the explicit type
+  pathops-oat+jwt (issued_token_type
+  urn:pathops:params:oauth:token-type:operation-authorization), aud = the
+  delegate, azp = the plan client, bound to the plan, operation,
+  Application, Run and exact details, living at most
+  authorizationTokensValidFor and never beyond the grant. The client keeps
+  the access token of its own login: the consent issues no access, ID or
+  refresh token. userinfo and introspection refuse the type, and delegation
+  requires a signer that can type tokens (the local signer);
 - a delegated derivation for the plan's delegate, an authenticated
   confidential client: an RFC 8693 token exchange whose subject is the
   operation grant handle (never a user token) mints a token with one
@@ -35,35 +45,43 @@ Without the configuration, behavior is unchanged.
 ---
  cmd/dex/config.go                     |   4 +
  cmd/dex/serve.go                      |  16 +
- server/authflow/dispatch.go           |  28 ++
+ server/authflow/dispatch.go           |  28 +
  server/authflow/handler.go            |   8 +
  server/authflow/login.go              |  13 +
- server/authflow/par.go                | 123 ++++++
- server/authflow/request.go            |  55 ++-
+ server/authflow/par.go                | 123 +++++
+ server/authflow/request.go            |  55 +-
  server/authflow/response.go           |   1 +
  server/config.go                      |   5 +
- server/consent/consent.go             |  88 ++++
- server/delegation/canonical.go        | 171 ++++++++
- server/delegation/delegation.go       | 291 +++++++++++++
+ server/consent/consent.go             | 128 +++++
+ server/delegation/authorization.go    | 101 ++++
+ server/delegation/canonical.go        | 171 ++++++
+ server/delegation/delegation.go       | 304 +++++++++++
  server/delegation/delegation_test.go  |  60 +++
- server/delegation/derive.go           |  84 ++++
+ server/delegation/derive.go           |  84 +++
  server/delegation/flow.go             |  40 ++
- server/delegation/grant.go            | 223 ++++++++++
- server/delegation/plan.go             | 398 +++++++++++++++++
+ server/delegation/grant.go            | 223 ++++++++
+ server/delegation/plan.go             | 445 ++++++++++++++++
  server/discovery/discovery.go         |  11 +
- server/grants/authcode.go             |  31 ++
- server/grants/delegation.go           |  76 ++++
+ server/grants/authcode.go             |  43 ++
+ server/grants/delegation.go           |  76 +++
  server/grants/grants.go               |  24 +-
- server/server.go                      |  10 +
- server/server_delegation_test.go      | 600 ++++++++++++++++++++++++++
- server/templates/templates.go         |  34 ++
+ server/introspection/introspection.go |   5 +
+ server/server.go                      |  14 +
+ server/server_delegation_test.go      | 724 ++++++++++++++++++++++++++
+ server/signer/local.go                |   8 +-
+ server/signer/mock.go                 |   4 +
+ server/signer/signer.go               |   7 +
+ server/signer/utils.go                |  11 +-
+ server/templates/templates.go         |  39 ++
  server/tokens/authorization.go        |   3 +
- storage/kubernetes/delegation_test.go |  24 ++
+ server/userinfo/userinfo.go           |   7 +
+ storage/kubernetes/delegation_test.go |  24 +
  storage/kubernetes/types.go           |  12 +-
  storage/storage.go                    |   9 +
- web/templates/delegation.html         |  55 +++
- 29 files changed, 2492 insertions(+), 5 deletions(-)
+ web/templates/delegation.html         | 138 +++++
+ 36 files changed, 2961 insertions(+), 7 deletions(-)
  create mode 100644 server/authflow/par.go
+ create mode 100644 server/delegation/authorization.go
  create mode 100644 server/delegation/canonical.go
  create mode 100644 server/delegation/delegation.go
  create mode 100644 server/delegation/delegation_test.go
@@ -494,11 +512,17 @@ index 554d37c..bd9174b 100644
  	AlwaysShowLoginScreen bool
  
 diff --git a/server/consent/consent.go b/server/consent/consent.go
-index e69d5da..e9fe147 100644
+index e69d5da..278c08b 100644
 --- a/server/consent/consent.go
 +++ b/server/consent/consent.go
-@@ -4,7 +4,10 @@ import (
+@@ -1,10 +1,16 @@
+ package consent
+ 
+ import (
++	"bytes"
  	"context"
++	"encoding/json"
++	"fmt"
  	"log/slog"
  	"net/http"
 +	"net/url"
@@ -508,7 +532,7 @@ index e69d5da..e9fe147 100644
  	"github.com/dexidp/dex/server/internal"
  	"github.com/dexidp/dex/server/oauth2"
  	"github.com/dexidp/dex/server/router"
-@@ -25,6 +28,11 @@ type Handler struct {
+@@ -25,6 +31,11 @@ type Handler struct {
  	IssuerURL    oauth2.IssuerURL
  	Sessions     *session.Manager
  	SkipApproval bool
@@ -520,7 +544,7 @@ index e69d5da..e9fe147 100644
  }
  
  // renderError renders a user-facing HTML error page.
-@@ -88,6 +96,11 @@ func (h *Handler) handleApproval(w http.ResponseWriter, r *http.Request) {
+@@ -88,6 +99,11 @@ func (h *Handler) handleApproval(w http.ResponseWriter, r *http.Request) {
  		return
  	}
  
@@ -532,7 +556,7 @@ index e69d5da..e9fe147 100644
  	switch r.Method {
  	case http.MethodGet:
  		// The dispatcher routes here only when consent is required, so just show
-@@ -143,3 +156,78 @@ func scopesCoveredByConsent(approved, requested []string) bool {
+@@ -143,3 +159,115 @@ func scopesCoveredByConsent(approved, requested []string) bool {
  
  	return true
  }
@@ -559,19 +583,33 @@ index e69d5da..e9fe147 100644
 +	plan := d.Plan
 +	switch r.Method {
 +	case http.MethodGet:
++		details := plan.Details
++		var indented bytes.Buffer
++		if json.Indent(&indented, plan.Details, "", "  ") == nil {
++			details = indented.Bytes()
++		}
 +		page := templates.DelegationPage{
-+			AuthReqID:   authReq.ID,
-+			User:        authReq.Claims.Email,
-+			Delegate:    h.Delegation.DelegateName(plan.Delegate),
-+			Operation:   plan.Operation,
-+			Application: plan.Application.Name,
-+			Run:         plan.Run.ID,
-+			Template:    plan.Template.ID + " (" + plan.Template.Source + " @ " + plan.Template.Ref + ")",
-+			Items:       h.Delegation.Describe(&plan),
-+			Details:     string(plan.Details),
-+			GrantTTL:    h.Delegation.GrantsValidFor().String(),
-+			TokenTTL:    h.Delegation.TokensValidFor().String(),
-+			PlanID:      plan.ID,
++			AuthReqID:      authReq.ID,
++			User:           authReq.Claims.Email,
++			Delegate:       h.Delegation.DelegateName(plan.Delegate),
++			Operation:      plan.Operation,
++			OperationTitle: operationTitles[plan.Operation],
++			Application:    plan.Application.Name,
++			ApplicationID:  plan.Application.ID,
++			Installation:   plan.Installation,
++			Run:            plan.Run.ID,
++			TemplateID:     plan.Template.ID,
++			TemplateSource: plan.Template.Source,
++			TemplateRef:    plan.Template.Ref,
++			TemplateRev:    plan.Template.Revision,
++			Consent:        h.Delegation.Consent(&plan),
++			Details:        string(details),
++			GrantTTL:       humanDuration(h.Delegation.GrantsValidFor()),
++			TokenTTL:       humanDuration(h.Delegation.TokensValidFor()),
++			PlanID:         plan.ID,
++		}
++		if page.OperationTitle == "" {
++			page.OperationTitle = plan.Operation
 +		}
 +		if err := h.Templates.Delegation(r, w, page); err != nil {
 +			h.Logger.ErrorContext(ctx, "server template error", "err", err)
@@ -610,6 +648,136 @@ index e69d5da..e9fe147 100644
 +	default:
 +		h.renderError(r, w, http.StatusBadRequest, "Unsupported request method.")
 +	}
++}
++
++// operationTitles name the operations of PathOps plans on the consent screen.
++var operationTitles = map[string]string{
++	"CREATE_APPLICATION": "Create an application",
++}
++
++// humanDuration says d in whole hours, minutes or seconds.
++func humanDuration(d time.Duration) string {
++	unit := func(n int64, name string) string {
++		if n == 1 {
++			return "1 " + name
++		}
++		return fmt.Sprintf("%d %ss", n, name)
++	}
++	switch {
++	case d >= time.Hour && d%time.Hour == 0:
++		return unit(int64(d/time.Hour), "hour")
++	case d >= time.Minute && d%time.Minute == 0:
++		return unit(int64(d/time.Minute), "minute")
++	default:
++		return unit(int64(d.Round(time.Second)/time.Second), "second")
++	}
++}
+diff --git a/server/delegation/authorization.go b/server/delegation/authorization.go
+new file mode 100644
+index 0000000..a45047e
+--- /dev/null
++++ b/server/delegation/authorization.go
+@@ -0,0 +1,101 @@
++package delegation
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"time"
++
++	jose "github.com/go-jose/go-jose/v4"
++
++	"github.com/dexidp/dex/server/signer"
++	"github.com/dexidp/dex/storage"
++)
++
++// Operation Authorization Token wire names (a PathOps extension).
++const (
++	// AuthorizationTokenType is the JWS "typ" of an Operation Authorization
++	// Token (RFC 8725 §3.11 explicit typing): no Dex ID or access token
++	// carries it.
++	AuthorizationTokenType = "pathops-oat+jwt"
++	// AuthorizationIssuedTokenType is the issued_token_type of the token
++	// response that carries one.
++	AuthorizationIssuedTokenType = "urn:pathops:params:oauth:token-type:operation-authorization"
++)
++
++// AuthorizationToken is an Operation Authorization Token.
++type AuthorizationToken struct {
++	Token  string
++	Expiry time.Time
++}
++
++// authorizationClaims are the token's claims. The audience is the delegate
++// only: the token proves to it that the subject approved exactly this plan.
++// It authenticates nobody, and neither Dex nor a tool accepts it.
++type authorizationClaims struct {
++	Issuer        string          `json:"iss"`
++	Subject       string          `json:"sub"`
++	Audience      string          `json:"aud"`
++	AZP           string          `json:"azp"`
++	IssuedAt      int64           `json:"iat"`
++	Expiry        int64           `json:"exp"`
++	ID            string          `json:"jti"`
++	Plan          string          `json:"pathops_plan"`
++	Installation  string          `json:"pathops_installation"`
++	Operation     string          `json:"pathops_operation"`
++	Application   string          `json:"pathops_application"`
++	Run           string          `json:"pathops_run"`
++	Details       json.RawMessage `json:"authorization_details"`
++	DetailsSHA256 string          `json:"authorization_details_sha256"`
++}
++
++// IssueAuthorization signs the Operation Authorization Token of an active
++// grant: the result of the user's consent, for the plan's client to present
++// to the delegate together with its own access token. It lives at most
++// authorizationTokensValidFor and never beyond the grant. The signer must
++// set the token's "typ".
++func (p *Policy) IssueAuthorization(ctx context.Context, sig signer.Signer, issuer string, g *Grant, now time.Time) (*AuthorizationToken, error) {
++	typed, ok := sig.(signer.TypedSigner)
++	if !ok {
++		return nil, errors.New("the signer cannot type an operation authorization token")
++	}
++	if g.Status != GrantActive || !now.Before(g.ExpiresAt) {
++		return nil, ErrGrantInactive
++	}
++	exp := now.Add(p.authTokenTTL)
++	if g.ExpiresAt.Before(exp) {
++		exp = g.ExpiresAt
++	}
++	payload, err := json.Marshal(authorizationClaims{
++		Issuer: issuer, Subject: g.Plan.Subject, Audience: g.Plan.Delegate, AZP: g.Plan.ClientID,
++		IssuedAt: now.Unix(), Expiry: exp.Unix(), ID: storage.NewID(),
++		Plan: g.Plan.ID, Installation: g.Plan.Installation, Operation: g.Plan.Operation,
++		Application: g.Plan.Application.ID, Run: g.Plan.Run.ID,
++		Details: g.Plan.Details, DetailsSHA256: g.Plan.DetailsSHA256,
++	})
++	if err != nil {
++		return nil, err
++	}
++	tok, err := typed.SignTyped(ctx, AuthorizationTokenType, payload)
++	if err != nil {
++		return nil, fmt.Errorf("signing an operation authorization token: %w", err)
++	}
++	return &AuthorizationToken{Token: tok, Expiry: exp}, nil
++}
++
++// IsAuthorizationToken reports whether raw is typed as an Operation
++// Authorization Token. It reads the JWS header only: callers that accept
++// Dex access tokens refuse such a token whatever its signature.
++func IsAuthorizationToken(raw string) bool {
++	jws, err := jose.ParseSigned(raw, allSignatureAlgorithms)
++	if err != nil || len(jws.Signatures) != 1 {
++		return false
++	}
++	typ, _ := jws.Signatures[0].Protected.ExtraHeaders[jose.HeaderType].(string)
++	return typ == AuthorizationTokenType
++}
++
++var allSignatureAlgorithms = []jose.SignatureAlgorithm{
++	jose.RS256, jose.RS384, jose.RS512, jose.ES256, jose.ES384, jose.ES512, jose.PS256, jose.PS384, jose.PS512, jose.EdDSA,
 +}
 diff --git a/server/delegation/canonical.go b/server/delegation/canonical.go
 new file mode 100644
@@ -790,10 +958,10 @@ index 0000000..5fad134
 +}
 diff --git a/server/delegation/delegation.go b/server/delegation/delegation.go
 new file mode 100644
-index 0000000..221d3d7
+index 0000000..e7f0b12
 --- /dev/null
 +++ b/server/delegation/delegation.go
-@@ -0,0 +1,291 @@
+@@ -0,0 +1,304 @@
 +// Package delegation is the PathOps extension for operation-scoped human
 +// delegated authorization (PathOps Decision 0050).
 +//
@@ -809,6 +977,8 @@ index 0000000..221d3d7
 +//	CLI --PAR(authorization_details, signed plan, PKCE challenge)--> Dex
 +//	Dex --request_uri--> CLI --> browser --> login --> per-operation consent
 +//	CLI --code + PKCE verifier--> Dex: the operation grant becomes active
++//	Dex --Operation Authorization Token: aud=<delegate>, the plan--> CLI
++//	CLI --its own access token + the Operation Authorization Token--> delegate
 +//	delegate --client auth + operation grant + detail subset--> Dex
 +//	Dex --short-lived token: aud=<tool audience>, exact details--> delegate
 +//
@@ -816,7 +986,10 @@ index 0000000..221d3d7
 +// issuer, and the pushed authorization_details are exactly (canonical JSON)
 +// the plan's. The consent screen shows the plan. Approval records an operation
 +// grant for the user; redeeming the authorization code with the plan's PKCE
-+// verifier activates it. Only the plan's delegate, authenticated as a
++// verifier activates it and returns an Operation Authorization Token: the
++// portable, signed proof of that consent, for the delegate only (see
++// authorization.go). It is not an access token of the client and the code
++// yields no other token. Only the plan's delegate, authenticated as a
 +// confidential client, can then derive tool tokens from it: one audience, a
 +// subset of the approved details, a short lifetime and no refresh token. The
 +// user's own access tokens never take part in the derivation.
@@ -866,6 +1039,9 @@ index 0000000..221d3d7
 +	GrantsValidFor string `json:"grantsValidFor"`
 +	// TokensValidFor bounds a derived tool token (default 5m).
 +	TokensValidFor string `json:"tokensValidFor"`
++	// AuthorizationTokensValidFor bounds an Operation Authorization Token
++	// (default 5m), never beyond the grant.
++	AuthorizationTokensValidFor string `json:"authorizationTokensValidFor"`
 +	// Delegates are the confidential clients that sign plans and derive tool
 +	// tokens from the resulting grants.
 +	Delegates []DelegateConfig `json:"delegates"`
@@ -912,6 +1088,7 @@ index 0000000..221d3d7
 +	maxPlanLifetime time.Duration
 +	grantTTL        time.Duration
 +	tokenTTL        time.Duration
++	authTokenTTL    time.Duration
 +	delegates       map[string]*delegate // by client id
 +	byIssuer        map[string]*delegate // by plan issuer
 +}
@@ -949,6 +1126,7 @@ index 0000000..221d3d7
 +		{"maxPlanLifetime", c.MaxPlanLifetime, 15 * time.Minute, time.Hour, &p.maxPlanLifetime},
 +		{"grantsValidFor", c.GrantsValidFor, 15 * time.Minute, 24 * time.Hour, &p.grantTTL},
 +		{"tokensValidFor", c.TokensValidFor, 5 * time.Minute, 15 * time.Minute, &p.tokenTTL},
++		{"authorizationTokensValidFor", c.AuthorizationTokensValidFor, 5 * time.Minute, 15 * time.Minute, &p.authTokenTTL},
 +	}
 +	for _, d := range durations {
 +		*d.into = d.def
@@ -961,8 +1139,8 @@ index 0000000..221d3d7
 +			return nil, fmt.Errorf("delegation.%s must be positive and at most %s", d.name, d.max)
 +		}
 +	}
-+	if p.tokenTTL > p.grantTTL {
-+		return nil, errors.New("delegation.tokensValidFor must not exceed grantsValidFor")
++	if p.tokenTTL > p.grantTTL || p.authTokenTTL > p.grantTTL {
++		return nil, errors.New("delegation.tokensValidFor and authorizationTokensValidFor must not exceed grantsValidFor")
 +	}
 +	if len(c.PlanClients) == 0 {
 +		return nil, errors.New("delegation.planClients is empty")
@@ -1082,6 +1260,9 @@ index 0000000..221d3d7
 +
 +// GrantsValidFor is an operation grant's lifetime from approval.
 +func (p *Policy) GrantsValidFor() time.Duration { return p.grantTTL }
++
++// AuthorizationTokensValidFor bounds an Operation Authorization Token.
++func (p *Policy) AuthorizationTokensValidFor() time.Duration { return p.authTokenTTL }
 +
 +// TokensValidFor bounds a derived tool token.
 +func (p *Policy) TokensValidFor() time.Duration { return p.tokenTTL }
@@ -1518,10 +1699,10 @@ index 0000000..850437b
 +}
 diff --git a/server/delegation/plan.go b/server/delegation/plan.go
 new file mode 100644
-index 0000000..b545267
+index 0000000..f768188
 --- /dev/null
 +++ b/server/delegation/plan.go
-@@ -0,0 +1,398 @@
+@@ -0,0 +1,445 @@
 +package delegation
 +
 +import (
@@ -1858,11 +2039,58 @@ index 0000000..b545267
 +	return c, toolName, nil
 +}
 +
-+// Describe renders the plan's details as consent lines.
-+func (p *Policy) Describe(pl *Plan) []string {
++// Consent is the consent screen's account of a plan's details: what each
++// tool resource is and which actions the user grants on it.
++type Consent struct {
++	Repositories []ConsentRepository
++	Webhooks     []ConsentWebhook
++	// Other are details of other types, described generically.
++	Other []string
++}
++
++// ConsentRepository is one repository detail.
++type ConsentRepository struct {
++	Tool, Name string
++	Actions    []ConsentAction
++	// Summary says what the actions do, in a sentence.
++	Summary string
++}
++
++// ConsentWebhook is one webhook detail.
++type ConsentWebhook struct {
++	Tool, Repository, URL string
++	Events                []string
++	Actions               []ConsentAction
++}
++
++// ConsentAction is an action and what it means.
++type ConsentAction struct {
++	Name, Meaning string
++}
++
++var actionMeanings = map[string]string{
++	"create":    "create it as a private repository",
++	"seed":      "write the template's initial content to it",
++	"configure": "configure it",
++}
++
++func consentActions(actions []string) []ConsentAction {
++	out := make([]ConsentAction, 0, len(actions))
++	for _, a := range actions {
++		m := actionMeanings[a]
++		if m == "" {
++			m = a
++		}
++		out = append(out, ConsentAction{Name: a, Meaning: m})
++	}
++	return out
++}
++
++// Consent describes pl's details for the consent screen, in plan order.
++func (p *Policy) Consent(pl *Plan) Consent {
 +	d := p.delegates[pl.Delegate]
 +	els, _ := elements(pl.Details)
-+	out := make([]string, 0, len(els))
++	var c Consent
 +	for _, el := range els {
 +		var m map[string]any
 +		_ = json.Unmarshal(el, &m)
@@ -1872,32 +2100,32 @@ index 0000000..b545267
 +		if d != nil && d.tools[dt.Tool] != nil {
 +			display = d.tools[dt.Tool].display
 +		}
-+		out = append(out, display+": "+describe(dt, m))
++		str := func(k string) string { s, _ := m[k].(string); return s }
++		repo := str("owner") + "/" + str("repository")
++		switch dt.Type {
++		case "pathops_repository":
++			actions := consentActions(dt.Actions)
++			meanings := make([]string, 0, len(actions))
++			for _, a := range actions {
++				meanings = append(meanings, a.Meaning)
++			}
++			summary := strings.Join(meanings, " and ")
++			if summary != "" {
++				summary = strings.ToUpper(summary[:1]) + summary[1:] + "."
++			}
++			c.Repositories = append(c.Repositories, ConsentRepository{Tool: display, Name: repo, Actions: actions, Summary: summary})
++		case "pathops_webhook":
++			c.Webhooks = append(c.Webhooks, ConsentWebhook{Tool: display, Repository: repo, URL: str("url"),
++				Events: eventList(m["events"]), Actions: consentActions(dt.Actions)})
++		default:
++			c.Other = append(c.Other, display+": "+describe(dt, m))
++		}
 +	}
-+	return out
++	return c
 +}
 +
++// describe is the generic account of a detail of an unknown type.
 +func describe(dt detail, m map[string]any) string {
-+	str := func(k string) string { s, _ := m[k].(string); return s }
-+	repo := str("owner") + "/" + str("repository")
-+	switch dt.Type {
-+	case "pathops_repository":
-+		var verbs []string
-+		for _, a := range dt.Actions {
-+			switch a {
-+			case "create":
-+				verbs = append(verbs, "create")
-+			case "seed":
-+				verbs = append(verbs, "write the template's initial content to")
-+			default:
-+				verbs = append(verbs, a)
-+			}
-+		}
-+		return fmt.Sprintf("%s the private repository %s", strings.Join(verbs, " and "), repo)
-+	case "pathops_webhook":
-+		return fmt.Sprintf("%s the webhook of %s that sends %s events to %s",
-+			strings.Join(dt.Actions, " and "), repo, eventList(m["events"]), str("url"))
-+	}
 +	keys := make([]string, 0, len(m))
 +	for k := range m {
 +		if k != "type" && k != "tool" && k != "actions" {
@@ -1912,13 +2140,13 @@ index 0000000..b545267
 +	return strings.Join(parts, " ")
 +}
 +
-+func eventList(v any) string {
++func eventList(v any) []string {
 +	list, _ := v.([]any)
 +	s := make([]string, 0, len(list))
 +	for _, e := range list {
 +		s = append(s, fmt.Sprint(e))
 +	}
-+	return strings.Join(s, ", ")
++	return s
 +}
 diff --git a/server/discovery/discovery.go b/server/discovery/discovery.go
 index d9119d4..2773ca1 100644
@@ -1963,59 +2191,72 @@ index d9119d4..2773ca1 100644
  	return d
  }
 diff --git a/server/grants/authcode.go b/server/grants/authcode.go
-index d75716c..cbd396e 100644
+index d75716c..42b1cd5 100644
 --- a/server/grants/authcode.go
 +++ b/server/grants/authcode.go
-@@ -7,6 +7,7 @@ import (
+@@ -7,7 +7,9 @@ import (
  	"time"
  
  	"github.com/dexidp/dex/server/connectors"
 +	"github.com/dexidp/dex/server/delegation"
  	"github.com/dexidp/dex/server/oauth2"
++	"github.com/dexidp/dex/server/signer"
  	"github.com/dexidp/dex/server/tokens"
  	"github.com/dexidp/dex/storage"
-@@ -20,6 +21,7 @@ type authorizationCode struct {
+ )
+@@ -20,6 +22,10 @@ type authorizationCode struct {
  	connectors *connectors.Cache
  	now        func() time.Time
  	logger     *slog.Logger
 +	delegation *delegation.Policy
++	// signer and issuerURL sign Operation Authorization Tokens.
++	signer    signer.Signer
++	issuerURL string
  }
  
  func (g *authorizationCode) GrantType() string {
-@@ -69,9 +71,38 @@ func (g *authorizationCode) Authorize(ctx context.Context, req *Request, client
+@@ -69,9 +75,46 @@ func (g *authorizationCode) Authorize(ctx context.Context, req *Request, client
  	if err != nil {
  		return nil, err
  	}
 +	if len(authCode.Delegation) > 0 {
-+		return g.completeDelegation(ctx, authCode, auth, withRefresh)
++		return g.completeDelegation(ctx, authCode)
 +	}
  	return issueTokens(ctx, g.logger, g.issuer, auth, authCode.ID, withRefresh)
  }
  
 +// completeDelegation activates the operation grant of a code issued for a
 +// PathOps Authorization Plan: the plan's client redeemed it with the PKCE
-+// verifier of the plan's challenge. The response carries the approved
-+// authorization_details; the tokens themselves are the client's usual ones.
-+func (g *authorizationCode) completeDelegation(ctx context.Context, authCode storage.AuthCode, auth tokens.Authorization, withRefresh bool) (Responder, error) {
++// verifier of the plan's challenge. The response carries only the Operation
++// Authorization Token (issued_token_type says so) and the approved
++// authorization_details: the consent yields no access, ID or refresh token,
++// so the client keeps the access token of its own login.
++func (g *authorizationCode) completeDelegation(ctx context.Context, authCode storage.AuthCode) (Responder, error) {
 +	d, err := delegation.DecodeRequest(authCode.Delegation)
 +	if err != nil || d == nil || g.delegation == nil {
 +		g.logger.ErrorContext(ctx, "auth code with unusable delegation state", "err", err)
 +		return nil, &oauth2.Error{Type: oauth2.ServerError, Status: http.StatusInternalServerError}
 +	}
-+	grant, err := g.delegation.Activate(ctx, g.storage, &d.Plan, g.now())
++	now := g.now()
++	grant, err := g.delegation.Activate(ctx, g.storage, &d.Plan, now)
 +	if err != nil {
 +		g.logger.InfoContext(ctx, "operation grant not activated", "plan", d.Plan.ID, "err", err)
 +		return nil, &oauth2.Error{Type: oauth2.InvalidGrant, Description: "The operation grant cannot be completed: " + err.Error(), Status: http.StatusBadRequest}
 +	}
 +	g.logger.InfoContext(ctx, "operation grant active", "plan", d.Plan.ID, "delegate", d.Plan.Delegate,
 +		"application", d.Plan.Application.Name, "run", d.Plan.Run.ID, "expires_at", grant.ExpiresAt.Format(time.RFC3339))
-+	resp, err := g.issuer.IssueResponse(ctx, auth, authCode.ID, withRefresh)
++	tok, err := g.delegation.IssueAuthorization(ctx, g.signer, g.issuerURL, grant, now)
 +	if err != nil {
-+		g.logger.ErrorContext(ctx, "failed to issue tokens", "err", err)
++		g.logger.ErrorContext(ctx, "failed to issue the operation authorization token", "plan", d.Plan.ID, "err", err)
 +		return nil, &oauth2.Error{Type: oauth2.ServerError, Status: http.StatusInternalServerError}
 +	}
-+	resp.AuthorizationDetails = d.Plan.Details
-+	return resp, nil
++	return tokens.Response{
++		AccessToken:          tok.Token,
++		IssuedTokenType:      delegation.AuthorizationIssuedTokenType,
++		TokenType:            "bearer",
++		ExpiresIn:            int(tok.Expiry.Sub(now).Seconds()),
++		AuthorizationDetails: d.Plan.Details,
++	}, nil
 +}
 +
  // ExchangeAuthCode consumes a validated authorization code and returns the
@@ -2104,7 +2345,7 @@ index 0000000..3f59179
 +	}, nil
 +}
 diff --git a/server/grants/grants.go b/server/grants/grants.go
-index 04eba65..0cbebbc 100644
+index 04eba65..1259e05 100644
 --- a/server/grants/grants.go
 +++ b/server/grants/grants.go
 @@ -13,10 +13,12 @@ import (
@@ -2159,7 +2400,7 @@ index 04eba65..0cbebbc 100644
  		&tokenExchange{issuer: h.Issuer, logger: h.Logger},
 -		&authorizationCode{issuer: h.Issuer, storage: h.Storage, connectors: h.Connectors, now: h.Now, logger: h.Logger},
 +		&authorizationCode{issuer: h.Issuer, storage: h.Storage, connectors: h.Connectors, now: h.Now, logger: h.Logger,
-+			delegation: h.Delegation},
++			delegation: h.Delegation, signer: h.Signer, issuerURL: h.IssuerURL},
  		&refresh{storage: h.Storage, issuer: h.Issuer, policy: h.RefreshPolicy, sessions: h.Sessions, sessionsEnabled: h.SessionsEnabled, now: h.Now, logger: h.Logger},
  		&deviceCode{storage: h.Storage, now: h.Now, logger: h.Logger},
  	)
@@ -2180,11 +2421,42 @@ index 04eba65..0cbebbc 100644
  	if !h.dispatch(w, r, grantType) {
  		h.Logger.ErrorContext(ctx, "unsupported grant type", "grant_type", grantType)
  		h.writeError(ctx, w, &oauth2.Error{Type: oauth2.UnsupportedGrantType, Status: http.StatusBadRequest})
+diff --git a/server/introspection/introspection.go b/server/introspection/introspection.go
+index eee7480..1361591 100644
+--- a/server/introspection/introspection.go
++++ b/server/introspection/introspection.go
+@@ -10,6 +10,7 @@ import (
+ 
+ 	"github.com/coreos/go-oidc/v3/oidc"
+ 
++	"github.com/dexidp/dex/server/delegation"
+ 	"github.com/dexidp/dex/server/internal"
+ 	"github.com/dexidp/dex/server/oauth2"
+ 	"github.com/dexidp/dex/server/router"
+@@ -305,6 +306,10 @@ func (h *Handler) sessionAlive(ctx context.Context, client storage.Client, subje
+ }
+ 
+ func (h *Handler) introspectAccessToken(ctx context.Context, token string) (*Introspection, error) {
++	// An Operation Authorization Token is not an access token.
++	if delegation.IsAuthorizationToken(token) {
++		return nil, newIntrospectInactiveTokenError()
++	}
+ 	verifier := oidc.NewVerifier(h.Issuer, &signer.KeySet{Signer: h.Signer}, &oidc.Config{SkipClientIDCheck: true})
+ 	idToken, err := verifier.Verify(ctx, token)
+ 	if err != nil {
 diff --git a/server/server.go b/server/server.go
-index 6433b61..6113232 100644
+index 6433b61..4985756 100644
 --- a/server/server.go
 +++ b/server/server.go
-@@ -123,6 +123,10 @@ func newServer(ctx context.Context, c Config) (*Server, error) {
+@@ -28,6 +28,7 @@ import (
+ 	"github.com/dexidp/dex/server/oauth2"
+ 	"github.com/dexidp/dex/server/router"
+ 	"github.com/dexidp/dex/server/session"
++	"github.com/dexidp/dex/server/signer"
+ 	"github.com/dexidp/dex/server/templates"
+ 	"github.com/dexidp/dex/server/tokens"
+ 	"github.com/dexidp/dex/server/userinfo"
+@@ -123,6 +124,13 @@ func newServer(ctx context.Context, c Config) (*Server, error) {
  		GrantTypes:      rc.grantTypes,
  		PKCEMethods:     c.PKCE.CodeChallengeMethodsSupported,
  		SessionsEnabled: c.SessionConfig != nil,
@@ -2192,10 +2464,13 @@ index 6433b61..6113232 100644
 +	}
 +	if c.Delegation != nil && !s.templates.HasDelegation() {
 +		return nil, errors.New("server: delegation is configured but the frontend has no delegation.html template")
++	}
++	if _, ok := c.Signer.(signer.TypedSigner); c.Delegation != nil && !ok {
++		return nil, errors.New("server: delegation requires a signer that types its tokens (the local signer)")
  	}
  
  	if err := s.openConnectors(ctx, c); err != nil {
-@@ -246,6 +250,9 @@ func (s *Server) mount(routes router.Mux, c Config, rc resolvedConfig) {
+@@ -246,6 +254,9 @@ func (s *Server) mount(routes router.Mux, c Config, rc resolvedConfig) {
  			Sessions:            sessions,
  			SessionsEnabled:     c.SessionConfig != nil,
  			SupportedGrantTypes: rc.grantTypes,
@@ -2205,7 +2480,7 @@ index 6433b61..6113232 100644
  		},
  		&userinfo.Handler{
  			Issuer: s.issuerURL.String(),
-@@ -294,6 +301,7 @@ func (s *Server) mount(routes router.Mux, c Config, rc resolvedConfig) {
+@@ -294,6 +305,7 @@ func (s *Server) mount(routes router.Mux, c Config, rc resolvedConfig) {
  			MFAEnabled:             len(c.MFAProviders) > 0,
  			DefaultMFAChain:        c.DefaultMFAChain,
  			SkipApproval:           c.SkipApprovalScreen,
@@ -2213,7 +2488,7 @@ index 6433b61..6113232 100644
  		},
  		&mfa.Handler{
  			Storage:         s.storage,
-@@ -312,6 +320,8 @@ func (s *Server) mount(routes router.Mux, c Config, rc resolvedConfig) {
+@@ -312,6 +324,8 @@ func (s *Server) mount(routes router.Mux, c Config, rc resolvedConfig) {
  			IssuerURL:    s.issuerURL,
  			Sessions:     sessions,
  			SkipApproval: c.SkipApprovalScreen,
@@ -2224,10 +2499,10 @@ index 6433b61..6113232 100644
  			Storage:     s.storage,
 diff --git a/server/server_delegation_test.go b/server/server_delegation_test.go
 new file mode 100644
-index 0000000..4ed30dd
+index 0000000..ea81d73
 --- /dev/null
 +++ b/server/server_delegation_test.go
-@@ -0,0 +1,600 @@
+@@ -0,0 +1,724 @@
 +package server
 +
 +import (
@@ -2272,15 +2547,22 @@ index 0000000..4ed30dd
 +	key     ed25519.PrivateKey
 +	kid     string
 +	subject string
++	// jar keeps the browser's cookies (the Dex session); visited records
++	// every path requested.
++	jar     map[string]*http.Cookie
++	visited []string
 +}
 +
-+func newDelegationEnv(t *testing.T) *dlgEnv {
++func newDelegationEnv(t *testing.T, opts ...func(*Config)) *dlgEnv {
 +	t.Helper()
 +	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 +	require.NoError(t, err)
 +	clock := time.Now()
-+	e := &dlgEnv{t: t, clock: &clock, key: priv, kid: "plan-1"}
++	e := &dlgEnv{t: t, clock: &clock, key: priv, kid: "plan-1", jar: map[string]*http.Cookie{}}
 +	_, s := newTestServer(t, func(c *Config) {
++		for _, o := range opts {
++			o(c)
++		}
 +		c.Now = func() time.Time { return *e.clock }
 +		policy, err := delegation.NewPolicy(delegation.Config{
 +			PlanClients: []string{dlgCLI},
@@ -2396,8 +2678,19 @@ index 0000000..4ed30dd
 +	if len(basic) == 2 {
 +		req.SetBasicAuth(basic[0], basic[1])
 +	}
++	for _, c := range e.jar {
++		req.AddCookie(c)
++	}
++	e.visited = append(e.visited, req.URL.Path)
 +	rr := httptest.NewRecorder()
 +	e.s.ServeHTTP(rr, req)
++	for _, c := range rr.Result().Cookies() {
++		if c.MaxAge < 0 {
++			delete(e.jar, c.Name)
++		} else {
++			e.jar[c.Name] = c
++		}
++	}
 +	return rr
 +}
 +
@@ -2497,6 +2790,13 @@ index 0000000..4ed30dd
 +
 +// granted runs the whole flow for app and returns the plan id.
 +func (e *dlgEnv) granted(app string) (string, []map[string]any) {
++	id, details, _ := e.authorized(app)
++	return id, details
++}
++
++// authorized runs the whole flow for app and returns the plan id, the details
++// and the code response's Operation Authorization Token.
++func (e *dlgEnv) authorized(app string) (string, []map[string]any, string) {
 +	pk := newPKCE()
 +	details := dlgDetails("kilgore", app, "app-id-"+app)
 +	plan, raw := e.plan(app, pk, details, nil)
@@ -2507,7 +2807,19 @@ index 0000000..4ed30dd
 +	require.NotEmpty(e.t, code)
 +	rr := e.redeem(code, pk)
 +	require.Equal(e.t, http.StatusOK, rr.Code, rr.Body.String())
-+	return planID(e.t, plan), details
++	var tr struct {
++		AccessToken string `json:"access_token"`
++	}
++	require.NoError(e.t, json.Unmarshal(rr.Body.Bytes(), &tr))
++	return planID(e.t, plan), details, tr.AccessToken
++}
++
++// jwtType is the "typ" header of a compact JWS.
++func jwtType(t *testing.T, tok string) string {
++	jws, err := jose.ParseSigned(tok, []jose.SignatureAlgorithm{jose.RS256})
++	require.NoError(t, err)
++	typ, _ := jws.Signatures[0].Protected.ExtraHeaders[jose.HeaderType].(string)
++	return typ
 +}
 +
 +func planID(t *testing.T, plan string) string {
@@ -2548,10 +2860,19 @@ index 0000000..4ed30dd
 +	handle := delegation.Handle(id, e.subject)
 +
 +	page, approval := e.consent(e.requestURI(plan, raw, pk))
-+	for _, want := range []string{"PathOps Tenant Control Plane (test)", "CREATE_APPLICATION", "app-a",
-+		"Forgejo: create and write the template&#39;s initial content to the private repository kilgore/app-a",
-+		"kilgore/app-a-gitops-preflight", "kilgore/app-a-gitops-production",
-+		"Forgejo: configure the webhook of kilgore/app-a that sends push events to " + dlgWebhookBase + "app-id-app-a"} {
++	for _, want := range []string{"PathOps Tenant Control Plane (test)", "Create an application: <code>app-a</code>",
++		"<code>CREATE_APPLICATION</code>", "<h3>Repositories</h3>", "<h3>Webhook</h3>",
++		`<code class="pc-name">kilgore/app-a</code>`, `<code class="pc-name">kilgore/app-a-gitops-preflight</code>`,
++		`<code class="pc-name">kilgore/app-a-gitops-production</code>`,
++		`<span class="pc-chip" title="create it as a private repository">create</span>`,
++		`<span class="pc-chip" title="write the template&#39;s initial content to it">seed</span>`,
++		"Create it as a private repository and write the template&#39;s initial content to it.",
++		`<span class="pc-chip">push</span>`, "<code>" + dlgWebhookBase + "app-id-app-a</code>",
++		`<span class="pc-chip" title="configure it">configure</span>`,
++		"<code>generic-container</code> from <code>https://github.com/PathOps/pathops-templates</code> @ <code>main</code>",
++		"<code>33333333-2222-4333-8444-cccccccccccc</code>", "<code>" + id + "</code>",
++		"<strong>15 minutes</strong>", "<strong>5 minutes</strong>",
++		"\n  {\n    &#34;actions&#34;: [\n      &#34;create&#34;,", `id="pathops-approve"`, `id="pathops-reject"`} {
 +		require.Contains(t, page, want)
 +	}
 +
@@ -2570,13 +2891,50 @@ index 0000000..4ed30dd
 +	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
 +	var tr struct {
 +		AccessToken          string          `json:"access_token"`
++		IssuedTokenType      string          `json:"issued_token_type"`
++		TokenType            string          `json:"token_type"`
++		ExpiresIn            int             `json:"expires_in"`
 +		RefreshToken         string          `json:"refresh_token"`
++		IDToken              string          `json:"id_token"`
 +		AuthorizationDetails json.RawMessage `json:"authorization_details"`
 +	}
 +	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &tr))
 +	canonical, _ := delegation.Canonical([]byte(raw))
 +	require.JSONEq(t, string(canonical), string(tr.AuthorizationDetails))
-+	require.Equal(t, dlgCLI, jwtClaims(t, tr.AccessToken)["aud"], "the CLI's own token is unchanged")
++
++	// The consent yields only an Operation Authorization Token: for the
++	// delegate, typed, bound to the plan; no access, ID or refresh token of
++	// the CLI.
++	require.Equal(t, delegation.AuthorizationIssuedTokenType, tr.IssuedTokenType)
++	require.Equal(t, "bearer", tr.TokenType)
++	require.Empty(t, tr.RefreshToken)
++	require.Empty(t, tr.IDToken)
++	require.Equal(t, 300, tr.ExpiresIn)
++	require.Equal(t, delegation.AuthorizationTokenType, jwtType(t, tr.AccessToken))
++	require.True(t, delegation.IsAuthorizationToken(tr.AccessToken))
++	oat := jwtClaims(t, tr.AccessToken)
++	for k, want := range map[string]any{
++		"iss": e.issuer, "sub": e.subject, "aud": dlgTCP, "azp": dlgCLI, "pathops_plan": id,
++		"pathops_installation": "dev", "pathops_operation": "CREATE_APPLICATION",
++		"pathops_application": "11111111-2222-4333-8444-aaaaaaaaaaaa", "pathops_run": "33333333-2222-4333-8444-cccccccccccc",
++		"authorization_details_sha256": delegation.DigestOf(canonical),
++	} {
++		require.Equal(t, want, oat[k], k)
++	}
++	require.JSONEq(t, string(canonical), mustJSON(t, oat["authorization_details"]))
++	require.EqualValues(t, 300, oat["exp"].(float64)-oat["iat"].(float64))
++	require.NotEmpty(t, oat["jti"])
++	require.NotContains(t, oat, "email", "it identifies the consent, not the user's profile")
++
++	// It is not an access token: Dex's userinfo and introspection refuse it.
++	req := httptest.NewRequest(http.MethodGet, "/userinfo", nil)
++	req.Header.Set("Authorization", "Bearer "+tr.AccessToken)
++	ui := httptest.NewRecorder()
++	e.s.ServeHTTP(ui, req)
++	require.Equal(t, http.StatusForbidden, ui.Code, ui.Body.String())
++	in := e.do(http.MethodPost, "/token/introspect", url.Values{"token": {tr.AccessToken}}, dlgTCP, dlgTCPSecret)
++	require.Equal(t, http.StatusOK, in.Code, in.Body.String())
++	require.JSONEq(t, `{"active":false}`, in.Body.String())
 +
 +	// One Step: the source repository only.
 +	rr = e.derive(handle, dlgAudience, details[:1])
@@ -2632,7 +2990,7 @@ index 0000000..4ed30dd
 +		"wrong audience":        {handle, "u:8:2f0c6a51-8d7e-4b8e-9c55-3a2f0e9b1c44", details[:1], nil, 400, "invalid_target"},
 +		"unknown grant":         {delegation.Handle("plan-nope-00000000", e.subject), dlgAudience, details[:1], nil, 400, "invalid_grant"},
 +		"another user's handle": {delegation.Handle(id, otherUser), dlgAudience, details[:1], nil, 400, "invalid_grant"},
-+		"user token as subject": {tr.AccessToken, dlgAudience, details[:1], nil, 400, "invalid_grant"},
++		"OAT as subject":        {tr.AccessToken, dlgAudience, details[:1], nil, 400, "invalid_grant"},
 +	} {
 +		t.Run(name, func(t *testing.T) {
 +			rr := e.derive(tc.handle, tc.audience, tc.details, tc.basic...)
@@ -2655,9 +3013,15 @@ index 0000000..4ed30dd
 +
 +func TestDelegationOperationsAreSeparate(t *testing.T) {
 +	e := newDelegationEnv(t)
-+	idA, detailsA := e.granted("app-a")
-+	idB, detailsB := e.granted("app-b")
++	idA, detailsA, oatA := e.authorized("app-a")
++	idB, detailsB, oatB := e.authorized("app-b")
 +	require.NotEqual(t, idA, idB)
++	require.NotEqual(t, oatA, oatB)
++	cA, cB := jwtClaims(t, oatA), jwtClaims(t, oatB)
++	require.Equal(t, idA, cA["pathops_plan"])
++	require.Equal(t, idB, cB["pathops_plan"])
++	require.NotEqual(t, cA["jti"], cB["jti"])
++	require.NotEqual(t, cA["pathops_application"], cB["pathops_application"])
 +
 +	hA, hB := delegation.Handle(idA, e.subject), delegation.Handle(idB, e.subject)
 +	require.Equal(t, http.StatusOK, e.derive(hA, dlgAudience, detailsA[:1]).Code)
@@ -2812,6 +3176,41 @@ index 0000000..4ed30dd
 +	require.Equal(t, []any{"pathops_repository", "pathops_webhook"}, d["authorization_details_types_supported"])
 +}
 +
++// With Dex sessions, one login serves later operations: the next plan's
++// consent screen shows without a new login, and still needs its own approval.
++func TestDelegationSessions(t *testing.T) {
++	e := newDelegationEnv(t, func(c *Config) { c.SessionConfig = testSessionConfig() })
++
++	_, _, oatA := e.authorized("app-a")
++	require.Contains(t, e.visited, "/callback", "the first operation logs in")
++	require.NotEmpty(t, e.jar["dex_session"], "the login opened a session")
++
++	e.visited = nil
++	pk := newPKCE()
++	details := dlgDetails("kilgore", "app-b", "app-id-app-b")
++	plan, raw := e.plan("app-b", pk, details, nil)
++	page, approval := e.consent(e.requestURI(plan, raw, pk))
++	require.NotContains(t, e.visited, "/callback", "the session authenticates the second operation")
++	require.Contains(t, page, "kilgore/app-b", "the second operation shows its own consent screen")
++
++	cb := e.approve(approval, "approve")
++	rr := e.redeem(cb.Query().Get("code"), pk)
++	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
++	var tr struct {
++		AccessToken string `json:"access_token"`
++	}
++	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &tr))
++	require.NotEqual(t, oatA, tr.AccessToken)
++	require.Equal(t, planID(t, plan), jwtClaims(t, tr.AccessToken)["pathops_plan"])
++
++	// A rejected consent in the same session grants nothing.
++	pk = newPKCE()
++	plan, raw = e.plan("app-b", pk, details, nil)
++	_, approval = e.consent(e.requestURI(plan, raw, pk))
++	require.Equal(t, "access_denied", e.approve(approval, "rejected").Query().Get("error"))
++	require.Equal(t, "invalid_grant", errorOf(t, e.derive(delegation.Handle(planID(t, plan), e.subject), dlgAudience, details[:1])))
++}
++
 +func TestDelegationCanonical(t *testing.T) {
 +	for in, want := range map[string]string{
 +		`[ {"b":1, "a":"x"} ]`:                `[{"a":"x","b":1}]`,
@@ -2828,11 +3227,100 @@ index 0000000..4ed30dd
 +		require.Error(t, err, bad)
 +	}
 +}
+diff --git a/server/signer/local.go b/server/signer/local.go
+index 30fd37d..a899403 100644
+--- a/server/signer/local.go
++++ b/server/signer/local.go
+@@ -98,6 +98,12 @@ func (l *localSigner) logRotateError(err error) {
+ }
+ 
+ func (l *localSigner) Sign(ctx context.Context, payload []byte) (string, error) {
++	return l.SignTyped(ctx, "", payload)
++}
++
++// SignTyped signs payload with the current signing key and a "typ" header
++// (none when typ is empty).
++func (l *localSigner) SignTyped(ctx context.Context, typ string, payload []byte) (string, error) {
+ 	keys, err := l.storage.GetKeys(ctx)
+ 	if err != nil {
+ 		return "", fmt.Errorf("failed to get keys: %v", err)
+@@ -112,7 +118,7 @@ func (l *localSigner) Sign(ctx context.Context, payload []byte) (string, error)
+ 		return "", err
+ 	}
+ 
+-	return signPayload(signingKey, signingAlg, payload)
++	return signTypedPayload(signingKey, signingAlg, typ, payload)
+ }
+ 
+ func (l *localSigner) ValidationKeys(ctx context.Context) ([]*jose.JSONWebKey, error) {
+diff --git a/server/signer/mock.go b/server/signer/mock.go
+index 832a9be..1897b81 100644
+--- a/server/signer/mock.go
++++ b/server/signer/mock.go
+@@ -59,6 +59,10 @@ func (m *mockSigner) Sign(_ context.Context, payload []byte) (string, error) {
+ 	return signPayload(m.key, jose.RS256, payload)
+ }
+ 
++func (m *mockSigner) SignTyped(_ context.Context, typ string, payload []byte) (string, error) {
++	return signTypedPayload(m.key, jose.RS256, typ, payload)
++}
++
+ func (m *mockSigner) ValidationKeys(_ context.Context) ([]*jose.JSONWebKey, error) {
+ 	return []*jose.JSONWebKey{m.pubKey}, nil
+ }
+diff --git a/server/signer/signer.go b/server/signer/signer.go
+index 1e15bbd..8b3412b 100644
+--- a/server/signer/signer.go
++++ b/server/signer/signer.go
+@@ -17,3 +17,10 @@ type Signer interface {
+ 	// Start starts any background tasks required by the signer (e.g., key rotation).
+ 	Start(ctx context.Context)
+ }
++
++// TypedSigner signs a payload with an explicit JWS "typ" header (RFC 8725
++// §3.11), so a token of one kind cannot be mistaken for another. PathOps
++// delegation signs Operation Authorization Tokens with it.
++type TypedSigner interface {
++	SignTyped(ctx context.Context, typ string, payload []byte) (string, error)
++}
+diff --git a/server/signer/utils.go b/server/signer/utils.go
+index 92926d5..6b8576e 100644
+--- a/server/signer/utils.go
++++ b/server/signer/utils.go
+@@ -60,9 +60,18 @@ func signatureAlgorithmFromECDSACurve(curve elliptic.Curve) (jose.SignatureAlgor
+ }
+ 
+ func signPayload(key *jose.JSONWebKey, alg jose.SignatureAlgorithm, payload []byte) (jws string, err error) {
++	return signTypedPayload(key, alg, "", payload)
++}
++
++// signTypedPayload signs payload with a "typ" header when typ is set.
++func signTypedPayload(key *jose.JSONWebKey, alg jose.SignatureAlgorithm, typ string, payload []byte) (jws string, err error) {
+ 	signingKey := jose.SigningKey{Key: key, Algorithm: alg}
+ 
+-	signer, err := jose.NewSigner(signingKey, &jose.SignerOptions{})
++	opts := &jose.SignerOptions{}
++	if typ != "" {
++		opts = opts.WithType(jose.ContentType(typ))
++	}
++	signer, err := jose.NewSigner(signingKey, opts)
+ 	if err != nil {
+ 		return "", fmt.Errorf("new signer: %v", err)
+ 	}
 diff --git a/server/templates/templates.go b/server/templates/templates.go
-index cc5e3dd..76ade09 100644
+index cc5e3dd..7973d60 100644
 --- a/server/templates/templates.go
 +++ b/server/templates/templates.go
-@@ -29,6 +29,8 @@ const (
+@@ -15,6 +15,8 @@ import (
+ 	"strings"
+ 
+ 	"github.com/Masterminds/sprig/v3"
++
++	"github.com/dexidp/dex/server/delegation"
+ )
+ 
+ const (
+@@ -29,6 +31,8 @@ const (
  	tmplWebAuthnVerify = "webauthn_verify.html"
  	tmplHome           = "home.html"
  	tmplLogout         = "logout.html"
@@ -2841,7 +3329,7 @@ index cc5e3dd..76ade09 100644
  )
  
  var requiredTmpls = []string{
-@@ -57,6 +59,7 @@ type Templates struct {
+@@ -57,6 +61,7 @@ type Templates struct {
  	webauthnVerifyTmpl *template.Template
  	homeTmpl           *template.Template
  	logoutTmpl         *template.Template
@@ -2849,7 +3337,7 @@ index cc5e3dd..76ade09 100644
  }
  
  type Config struct {
-@@ -188,6 +191,7 @@ func loadTemplates(c Config, templatesDir string) (*Templates, error) {
+@@ -188,6 +193,7 @@ func loadTemplates(c Config, templatesDir string) (*Templates, error) {
  		webauthnVerifyTmpl: tmpls.Lookup(tmplWebAuthnVerify),
  		homeTmpl:           tmpls.Lookup(tmplHome),
  		logoutTmpl:         tmpls.Lookup(tmplLogout),
@@ -2857,21 +3345,24 @@ index cc5e3dd..76ade09 100644
  	}, nil
  }
  
-@@ -368,6 +372,36 @@ func (t *Templates) Approval(r *http.Request, w http.ResponseWriter, authReqID,
+@@ -368,6 +374,39 @@ func (t *Templates) Approval(r *http.Request, w http.ResponseWriter, authReqID,
  	return renderTemplate(w, t.approvalTmpl, data)
  }
  
 +// DelegationPage is the consent screen of a PathOps Authorization Plan.
 +type DelegationPage struct {
-+	AuthReqID   string
-+	User        string
-+	Delegate    string
-+	Operation   string
-+	Application string
-+	Run         string
-+	Template    string
-+	// Items describe each authorization detail; Details is their exact JSON.
-+	Items    []string
++	AuthReqID string
++	User      string
++	Delegate  string
++	// Operation is the plan's operation; OperationTitle says it in words.
++	Operation, OperationTitle  string
++	Application, ApplicationID string
++	Installation               string
++	Run                        string
++	TemplateID, TemplateSource string
++	TemplateRef, TemplateRev   string
++	// Consent describes the details; Details is their exact JSON, indented.
++	Consent  delegation.Consent
 +	Details  string
 +	GrantTTL string
 +	TokenTTL string
@@ -2908,6 +3399,31 @@ index 3851026..6ec1af1 100644
  }
  
  // Response renders the token set as an OAuth2 token response as of now, filling
+diff --git a/server/userinfo/userinfo.go b/server/userinfo/userinfo.go
+index 21ae63f..807e26e 100644
+--- a/server/userinfo/userinfo.go
++++ b/server/userinfo/userinfo.go
+@@ -8,6 +8,7 @@ import (
+ 
+ 	"github.com/coreos/go-oidc/v3/oidc"
+ 
++	"github.com/dexidp/dex/server/delegation"
+ 	"github.com/dexidp/dex/server/oauth2"
+ 	"github.com/dexidp/dex/server/router"
+ 	"github.com/dexidp/dex/server/signer"
+@@ -36,6 +37,12 @@ func (h *Handler) handle(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 	rawIDToken := auth[len(prefix):]
++	// An Operation Authorization Token proves a consent to its delegate; it
++	// is not an access token.
++	if delegation.IsAuthorizationToken(rawIDToken) {
++		h.writeError(w, oauth2.AccessDenied, "Invalid bearer token.", http.StatusForbidden)
++		return
++	}
+ 
+ 	verifier := oidc.NewVerifier(h.Issuer, &signer.KeySet{Signer: h.Signer}, &oidc.Config{SkipClientIDCheck: true})
+ 	idToken, err := verifier.Verify(ctx, rawIDToken)
 diff --git a/storage/kubernetes/delegation_test.go b/storage/kubernetes/delegation_test.go
 new file mode 100644
 index 0000000..a76dc33
@@ -3025,62 +3541,145 @@ index 84976c5..f1964f5 100644
  // RefreshToken is an OAuth2 refresh token which allows a client to request new
 diff --git a/web/templates/delegation.html b/web/templates/delegation.html
 new file mode 100644
-index 0000000..2e6a525
+index 0000000..25dbb70
 --- /dev/null
 +++ b/web/templates/delegation.html
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,138 @@
 +{{ template "header.html" . }}
 +
-+<div class="theme-panel">
-+  <h2 class="theme-heading">Approve an operation</h2>
++<style>
++  /* The consent screen lists resources, URLs and JSON: it needs more room
++   * than the login panel the container is sized for. */
++  .dex-container:has(.pathops-consent) { max-width: 760px; }
++  .pathops-consent { text-align: left; line-height: 1.5; }
++  .pathops-consent .pc-eyebrow { font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; opacity: .65; margin: 0 0 4px; }
++  .pathops-consent .pc-title { margin-bottom: 8px; }
++  .pathops-consent .pc-title code { font-size: inherit; }
++  .pathops-consent .pc-lead { margin: 0 0 20px; }
++  .pathops-consent .pc-section { margin: 0 0 20px; }
++  .pathops-consent .pc-section h3 { font-size: 14px; font-weight: 600; margin: 0 0 8px; }
++  .pathops-consent .pc-list { list-style: none; margin: 0; padding: 0; }
++  .pathops-consent .pc-item { border: 1px solid rgba(127, 127, 127, .3); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
++  .pathops-consent .pc-item-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
++  .pathops-consent .pc-tool { font-size: 12px; opacity: .7; }
++  .pathops-consent code, .pathops-consent pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
++  .pathops-consent .pc-name { font-weight: 600; overflow-wrap: anywhere; }
++  .pathops-consent .pc-chips { display: inline-flex; flex-wrap: wrap; gap: 4px; }
++  .pathops-consent .pc-chip { border: 1px solid rgba(127, 127, 127, .45); border-radius: 999px; font-size: 12px; padding: 0 8px; white-space: nowrap; }
++  .pathops-consent .pc-note { font-size: 13px; opacity: .8; margin: 4px 0 0; }
++  .pathops-consent .pc-facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; align-items: baseline; margin: 0; }
++  .pathops-consent .pc-facts dt { font-size: 13px; opacity: .7; }
++  .pathops-consent .pc-facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
++  .pathops-consent .pc-limits { border-left: 3px solid rgba(127, 127, 127, .45); padding: 4px 0 4px 12px; font-size: 14px; }
++  .pathops-consent .pc-limits p { margin: 0 0 4px; }
++  .pathops-consent details { margin: 0 0 20px; }
++  .pathops-consent summary { cursor: pointer; font-size: 14px; }
++  .pathops-consent pre { background: rgba(127, 127, 127, .1); border-radius: 8px; margin: 8px 0 0; max-height: 360px; overflow: auto; padding: 12px; white-space: pre; }
++  .pathops-consent .pc-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 12px; }
++  .pathops-consent .pc-actions form { margin: 0; }
++  .pathops-consent .pc-actions .dex-btn { min-width: 160px; width: auto; padding: 10px 20px; }
++  @media (max-width: 560px) {
++    .pathops-consent .pc-facts { grid-template-columns: 1fr; gap: 0; }
++    .pathops-consent .pc-facts dd { margin-bottom: 6px; }
++    .pathops-consent .pc-actions { flex-direction: column-reverse; }
++    .pathops-consent .pc-actions .dex-btn { width: 100%; }
++  }
++</style>
 +
-+  <hr class="dex-separator">
-+  <div>
-+    <div class="dex-subtle-text">
-+      <strong>{{ .Delegate }}</strong> asks to act as <strong>{{ .User }}</strong> for this operation only:
-+    </div>
-+    <p id="pathops-operation"><strong>{{ .Operation }}</strong> &mdash; Application <strong>{{ .Application }}</strong></p>
-+    <ul class="dex-list" id="pathops-authorization-details">
-+      {{ range $item := .Items }}
-+      <li>{{ $item }}</li>
-+      {{ end }}
-+    </ul>
-+    <div class="dex-subtle-text">
-+      Template {{ .Template }}. Run {{ .Run }}.
-+    </div>
-+    <div class="dex-subtle-text">
-+      This approval covers only the resources listed above and expires {{ .GrantTTL }} after you approve.
-+      Each tool credential derived from it lasts at most {{ .TokenTTL }}, has no refresh token and carries only
-+      the part of this list its step needs. Another operation needs another approval.
-+    </div>
-+    <details>
-+      <summary class="dex-subtle-text">Exact authorization details (plan {{ .PlanID }})</summary>
-+      <pre id="pathops-authorization-details-json" style="white-space: pre-wrap; word-break: break-all;">{{ .Details }}</pre>
-+    </details>
++<div class="theme-panel pathops-consent">
++  <p class="pc-eyebrow">Approve an operation</p>
++  <h2 class="theme-heading pc-title" id="pathops-operation">{{ .OperationTitle }}: <code>{{ .Application }}</code></h2>
++  <p class="pc-lead">
++    <strong>{{ .Delegate }}</strong> asks to act as <strong>{{ .User }}</strong> for this operation only,
++    on exactly the resources below.
++  </p>
++
++  <div id="pathops-authorization-details">
++    {{ with .Consent.Repositories }}
++    <section class="pc-section">
++      <h3>Repositories</h3>
++      <ul class="pc-list">
++        {{ range . }}
++        <li class="pc-item">
++          <div class="pc-item-head">
++            <code class="pc-name">{{ .Name }}</code>
++            <span class="pc-chips">{{ range .Actions }}<span class="pc-chip" title="{{ .Meaning }}">{{ .Name }}</span>{{ end }}</span>
++            <span class="pc-tool">{{ .Tool }}</span>
++          </div>
++          <p class="pc-note">{{ .Summary }}</p>
++        </li>
++        {{ end }}
++      </ul>
++    </section>
++    {{ end }}
++
++    {{ with .Consent.Webhooks }}
++    <section class="pc-section">
++      <h3>{{ if gt (len .) 1 }}Webhooks{{ else }}Webhook{{ end }}</h3>
++      <ul class="pc-list">
++        {{ range . }}
++        <li class="pc-item">
++          <dl class="pc-facts">
++            <dt>Repository</dt><dd><code class="pc-name">{{ .Repository }}</code> <span class="pc-tool">{{ .Tool }}</span></dd>
++            <dt>Events</dt><dd><span class="pc-chips">{{ range .Events }}<span class="pc-chip">{{ . }}</span>{{ end }}</span></dd>
++            <dt>Destination</dt><dd><code>{{ .URL }}</code></dd>
++            <dt>Actions</dt><dd><span class="pc-chips">{{ range .Actions }}<span class="pc-chip" title="{{ .Meaning }}">{{ .Name }}</span>{{ end }}</span></dd>
++          </dl>
++        </li>
++        {{ end }}
++      </ul>
++    </section>
++    {{ end }}
++
++    {{ with .Consent.Other }}
++    <section class="pc-section">
++      <h3>Other resources</h3>
++      <ul class="pc-list">
++        {{ range . }}<li class="pc-item">{{ . }}</li>{{ end }}
++      </ul>
++    </section>
++    {{ end }}
 +  </div>
-+  <hr class="dex-separator">
 +
-+  <div>
-+    <div class="theme-form-row">
-+      <form method="post">
-+        <input type="hidden" name="req" value="{{ .AuthReqID }}"/>
-+        <input type="hidden" name="approval" value="approve">
-+        <button type="submit" id="pathops-approve" class="dex-btn theme-btn--success">
-+            <span class="dex-btn-text">Approve</span>
-+        </button>
-+      </form>
-+    </div>
-+    <div class="theme-form-row">
-+      <form method="post">
-+        <input type="hidden" name="req" value="{{ .AuthReqID }}"/>
-+        <input type="hidden" name="approval" value="rejected">
-+        <button type="submit" id="pathops-reject" class="dex-btn theme-btn-provider">
-+            <span class="dex-btn-text">Reject</span>
-+        </button>
-+      </form>
-+    </div>
++  <section class="pc-section">
++    <h3>Operation</h3>
++    <dl class="pc-facts">
++      <dt>Operation</dt><dd><code>{{ .Operation }}</code></dd>
++      <dt>Application</dt><dd><code>{{ .Application }}</code> <span class="pc-tool">{{ .ApplicationID }}</span></dd>
++      <dt>Template</dt><dd><code>{{ .TemplateID }}</code> from <code>{{ .TemplateSource }}</code> @ <code>{{ .TemplateRef }}</code>{{ with .TemplateRev }} (<code>{{ . }}</code>){{ end }}</dd>
++      {{ with .Installation }}<dt>Cell</dt><dd><code>{{ . }}</code></dd>{{ end }}
++      <dt>Run</dt><dd><code>{{ .Run }}</code></dd>
++      <dt>Plan</dt><dd><code>{{ .PlanID }}</code></dd>
++    </dl>
++  </section>
++
++  <section class="pc-section pc-limits">
++    <p>This approval covers only the resources listed above and expires <strong>{{ .GrantTTL }}</strong> after you approve.</p>
++    <p>Each tool credential derived from it lasts at most <strong>{{ .TokenTTL }}</strong>, has no refresh token and carries only the part of this list its step needs.</p>
++    <p>Another operation needs another approval.</p>
++  </section>
++
++  <details>
++    <summary>Exact authorization details (JSON)</summary>
++    <pre id="pathops-authorization-details-json">{{ .Details }}</pre>
++  </details>
++
++  <div class="pc-actions">
++    <form method="post">
++      <input type="hidden" name="req" value="{{ .AuthReqID }}"/>
++      <input type="hidden" name="approval" value="rejected">
++      <button type="submit" id="pathops-reject" class="dex-btn theme-btn-provider">
++        <span class="dex-btn-text">Reject</span>
++      </button>
++    </form>
++    <form method="post">
++      <input type="hidden" name="req" value="{{ .AuthReqID }}"/>
++      <input type="hidden" name="approval" value="approve">
++      <button type="submit" id="pathops-approve" class="dex-btn theme-btn--success">
++        <span class="dex-btn-text">Approve</span>
++      </button>
++    </form>
 +  </div>
-+
 +</div>
 +
 +{{ template "footer.html" . }}

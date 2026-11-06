@@ -15,7 +15,8 @@ Current patch set:
 - `0003`: opt-in operation-scoped delegated authorization (PathOps Decision
   0050): pushed authorization requests (RFC 9126) carrying RAR
   `authorization_details` (RFC 9396) and a delegate-signed PathOps
-  Authorization Plan, a per-operation consent screen, operation grants, and
+  Authorization Plan, a per-operation consent screen, operation grants, an
+  Operation Authorization Token as the result of each consent, and
   Step-scoped tool tokens derived by the delegate. See
   [Delegation](#delegation).
 
@@ -73,6 +74,7 @@ delegation:
   maxPlanLifetime: 15m                # exp - iat of a plan
   grantsValidFor: 15m                 # operation grant, from approval
   tokensValidFor: 5m                  # derived tool token, never beyond the grant
+  authorizationTokensValidFor: 5m     # Operation Authorization Token, never beyond the grant
   delegates:
     - client: pathops-tenant-control-plane   # a confidential staticClient
       name: PathOps Tenant Control Plane     # shown on the consent screen
@@ -109,8 +111,10 @@ Flow:
    refused on the front channel.
 4. Approval records an **operation grant** in the user's `UserIdentity`
    (reserved `Consents` key, no schema change). It becomes active only when
-   the client redeems the code with the PKCE verifier; that token response
-   carries the approved `authorization_details`.
+   the client redeems the code with the PKCE verifier. That token response
+   carries only an **Operation Authorization Token** and the approved
+   `authorization_details` (see below): the consent issues no access, ID or
+   refresh token, so the client keeps the access token of its own login.
 5. The delegate, authenticated with its client secret, derives a tool token
    with an RFC 8693 token exchange whose `subject_token` is the operation
    grant handle `pog1:<plan id>:<sub>` (`subject_token_type`
@@ -120,6 +124,42 @@ Flow:
    details, a lifetime of at most `tokensValidFor` and never beyond the grant,
    and no refresh token. Public clients, other clients, other users' or
    other operations' grants, wider details and other audiences are refused.
+
+### Operation Authorization Token
+
+A PathOps extension, not an OAuth/OIDC standard. It is the portable, signed
+proof that the user approved one plan, for the delegate only:
+
+- a JWS signed with Dex's keys (the issuer's JWKS), with the explicit type
+  `typ: pathops-oat+jwt` (RFC 8725 §3.11);
+- returned in the `access_token` member of the code's token response (RFC
+  6749 requires that member) with `issued_token_type`
+  `urn:pathops:params:oauth:token-type:operation-authorization`;
+- claims:
+
+  | claim | value |
+  | --- | --- |
+  | `iss`, `sub` | this Dex, the user who approved |
+  | `aud` | the plan's delegate (one value) |
+  | `azp` | the plan client that redeemed the code |
+  | `pathops_plan` | the plan id (the operation grant) |
+  | `pathops_installation`, `pathops_operation` | the plan's Cell and operation |
+  | `pathops_application`, `pathops_run` | the plan's Application and Run ids |
+  | `authorization_details`, `authorization_details_sha256` | the exact approved details and their digest |
+  | `iat`, `exp`, `jti` | at most `authorizationTokensValidFor`, never beyond the grant; unique |
+
+The client presents it to the delegate next to its own access token, and the
+delegate checks both and their binding. It authenticates nobody: Dex's
+userinfo and introspection refuse it, its audience is no tool's, and it is
+never a derivation subject (that is the grant handle, for the delegate only).
+Delegation requires a signer that can type tokens (the local signer).
+
+### Login sessions
+
+Delegation works with Dex's experimental login sessions
+(`DEX_SESSIONS_ENABLED=true` and `sessions:`): a session spares the user a new
+password for the next operation, but each operation still shows its own
+consent screen, and a request_uri is consumed before any session login.
 
 The in-flight plan rides on a new `Delegation` field of auth requests and auth
 codes, kept by the kubernetes and memory storages; Dex refuses to start with
