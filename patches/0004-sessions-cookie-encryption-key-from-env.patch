@@ -1,0 +1,97 @@
+From 87bb1b3a1138a3cc4e7e1f6ea453c23c1f9fd23c Mon Sep 17 00:00:00 2001
+From: PathOps <noreply@pathops.dev>
+Date: Fri, 6 Nov 2026 04:09:06 -0300
+Subject: [PATCH] sessions: read the cookie encryption key from the environment
+
+Add sessions.cookieEncryptionKeyFromEnv, which names an environment variable
+holding the session cookie encryption key, in the manner of staticPasswords'
+hashFromEnv. A deployment can then keep the key in a secret store (a
+Kubernetes Secret) instead of the configuration file. Setting both
+cookieEncryptionKey and cookieEncryptionKeyFromEnv, or naming an empty
+variable, is an error; the key length checks are unchanged.
+---
+ cmd/dex/config.go           |  4 ++++
+ cmd/dex/serve.go            | 10 ++++++++++
+ cmd/dex/session_key_test.go | 31 +++++++++++++++++++++++++++++++
+ 3 files changed, 45 insertions(+)
+ create mode 100644 cmd/dex/session_key_test.go
+
+diff --git a/cmd/dex/config.go b/cmd/dex/config.go
+index ecb995e..6a45554 100644
+--- a/cmd/dex/config.go
++++ b/cmd/dex/config.go
+@@ -726,6 +726,10 @@ type Sessions struct {
+ 	// Must be 16, 24, or 32 bytes for AES-128, AES-192, or AES-256.
+ 	// If empty, cookies are not encrypted.
+ 	CookieEncryptionKey string `json:"cookieEncryptionKey"`
++	// CookieEncryptionKeyFromEnv names an environment variable holding the
++	// cookie encryption key instead (e.g. from a Kubernetes Secret), so the
++	// key need not be written in the configuration file.
++	CookieEncryptionKeyFromEnv string `json:"cookieEncryptionKeyFromEnv"`
+ 	// SSOSharedWithDefault is the default SSO sharing policy for clients without explicit ssoSharedWith.
+ 	// "all" = share with all clients, "none" = share with no one (default: "none").
+ 	SSOSharedWithDefault string `json:"ssoSharedWithDefault"`
+diff --git a/cmd/dex/serve.go b/cmd/dex/serve.go
+index e5e66ff..bf755c8 100644
+--- a/cmd/dex/serve.go
++++ b/cmd/dex/serve.go
+@@ -908,9 +908,19 @@ func parseSessionConfig(s *Sessions) (*session.Config, error) {
+ 		if s.RememberMeCheckedByDefault != nil {
+ 			sc.RememberMeCheckedByDefault = *s.RememberMeCheckedByDefault
+ 		}
++		if s.CookieEncryptionKey != "" && s.CookieEncryptionKeyFromEnv != "" {
++			return nil, errors.New("set cookieEncryptionKey or cookieEncryptionKeyFromEnv, not both")
++		}
+ 		if s.CookieEncryptionKey != "" {
+ 			sc.CookieEncryptionKey = []byte(s.CookieEncryptionKey)
+ 		}
++		if s.CookieEncryptionKeyFromEnv != "" {
++			key := os.Getenv(s.CookieEncryptionKeyFromEnv)
++			if key == "" {
++				return nil, fmt.Errorf("cookieEncryptionKeyFromEnv: %s is empty or unset", s.CookieEncryptionKeyFromEnv)
++			}
++			sc.CookieEncryptionKey = []byte(key)
++		}
+ 		if s.SSOSharedWithDefault != "" {
+ 			sc.SSOSharedWithDefault = s.SSOSharedWithDefault
+ 		}
+diff --git a/cmd/dex/session_key_test.go b/cmd/dex/session_key_test.go
+new file mode 100644
+index 0000000..b1bef3d
+--- /dev/null
++++ b/cmd/dex/session_key_test.go
+@@ -0,0 +1,31 @@
++package main
++
++import (
++	"strings"
++	"testing"
++)
++
++func TestSessionCookieKeyFromEnv(t *testing.T) {
++	t.Setenv("TEST_DEX_SESSION_KEY", "0123456789abcdef0123456789abcdef")
++	sc, err := parseSessionConfig(&Sessions{CookieEncryptionKeyFromEnv: "TEST_DEX_SESSION_KEY"})
++	if err != nil || string(sc.CookieEncryptionKey) != "0123456789abcdef0123456789abcdef" {
++		t.Fatalf("from env: %v", err)
++	}
++	for name, tc := range map[string]struct {
++		s    Sessions
++		want string
++	}{
++		"unset variable": {Sessions{CookieEncryptionKeyFromEnv: "TEST_DEX_SESSION_KEY_UNSET"}, "is empty or unset"},
++		"both":           {Sessions{CookieEncryptionKey: "0123456789abcdef", CookieEncryptionKeyFromEnv: "TEST_DEX_SESSION_KEY"}, "not both"},
++	} {
++		t.Run(name, func(t *testing.T) {
++			if _, err := parseSessionConfig(&tc.s); err == nil || !strings.Contains(err.Error(), tc.want) {
++				t.Fatalf("%v", err)
++			}
++		})
++	}
++	t.Setenv("TEST_DEX_SESSION_KEY", "short")
++	if _, err := parseSessionConfig(&Sessions{CookieEncryptionKeyFromEnv: "TEST_DEX_SESSION_KEY"}); err == nil {
++		t.Fatal("a 5-byte key was accepted")
++	}
++}
+-- 
+2.53.0
+

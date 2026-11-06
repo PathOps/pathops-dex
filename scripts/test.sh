@@ -32,6 +32,11 @@ echo "$out" | grep -E -- '--- (PASS|FAIL)'
 grep -q -- '--- PASS: TestTokenIdentitySubjectTokenAudiences ' <<< "$out" \
   || { echo "test: TestTokenIdentitySubjectTokenAudiences did not run and pass" >&2; exit 1; }
 
+echo "test: PathOps session cookie key test"
+out=$(go test ./cmd/dex/ -count=1 -run '^TestSessionCookieKeyFromEnv$' -v)
+grep -q -- '--- PASS: TestSessionCookieKeyFromEnv ' <<< "$out" \
+  || { echo "test: TestSessionCookieKeyFromEnv did not run and pass" >&2; exit 1; }
+
 echo "test: PathOps delegation tests"
 out=$(go test ./server/ ./server/delegation/ ./storage/kubernetes/ -count=1 -run 'Delegation|NewPolicy|AudiencePattern' -v)
 echo "$out" | grep -E -- '^--- (PASS|FAIL)'

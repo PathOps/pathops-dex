@@ -19,6 +19,9 @@ Current patch set:
   Operation Authorization Token as the result of each consent, and
   Step-scoped tool tokens derived by the delegate. See
   [Delegation](#delegation).
+- `0004`: `sessions.cookieEncryptionKeyFromEnv`: the session cookie
+  encryption key from an environment variable (a Kubernetes Secret) instead of
+  the configuration file, like `hashFromEnv` of static passwords.
 
 Long-term goal: remove the functional patch once equivalent functionality is
 available upstream, and consume official Dex images again.
@@ -159,7 +162,15 @@ Delegation requires a signer that can type tokens (the local signer).
 Delegation works with Dex's experimental login sessions
 (`DEX_SESSIONS_ENABLED=true` and `sessions:`): a session spares the user a new
 password for the next operation, but each operation still shows its own
-consent screen, and a request_uri is consumed before any session login.
+consent screen, and a request_uri is consumed before any session login. With
+patch `0004` the cookie key can come from the environment:
+
+```yaml
+sessions:
+  absoluteLifetime: 8h
+  validIfNotUsedFor: 1h
+  cookieEncryptionKeyFromEnv: DEX_SESSION_COOKIE_KEY   # 16, 24 or 32 bytes
+```
 
 The in-flight plan rides on a new `Delegation` field of auth requests and auth
 codes, kept by the kubernetes and memory storages; Dex refuses to start with
