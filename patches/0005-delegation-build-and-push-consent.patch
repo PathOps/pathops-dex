@@ -1,0 +1,288 @@
+From c6df09217c336b84066838b99680726217ca4226 Mon Sep 17 00:00:00 2001
+From: PathOps <noreply@pathops.dev>
+Date: Sat, 7 Nov 2026 23:49:54 -0300
+Subject: [PATCH 5/6] delegation: show BUILD_AND_PUSH credentials and
+ Kubernetes objects on the consent screen
+
+PathOps Decision 0056 adds three detail types to the create-app plan: a
+Forgejo repository read token (pathops_repository_token), a read-only
+deploy key (pathops_deploy_key) and the Kubernetes objects the
+Application's CI namespace needs (pathops_kubernetes_resource, one per
+object, tool "kubernetes"). The consent screen describes each instead of
+listing it as another resource: the repository, token name and scopes;
+the repository, key title and whether it is read-only; the object's
+kind and namespace/name. Action meanings depend on the detail type
+("create" a repository, a token or an object).
+---
+ server/delegation/delegation_test.go | 30 ++++++++++++
+ server/delegation/plan.go            | 71 +++++++++++++++++++++++++++-
+ server/templates/templates_test.go   | 40 +++++++++++++++-
+ web/templates/delegation.html        | 54 +++++++++++++++++++++
+ 4 files changed, 193 insertions(+), 2 deletions(-)
+
+diff --git a/server/delegation/delegation_test.go b/server/delegation/delegation_test.go
+index 4d4468e..2b2084f 100644
+--- a/server/delegation/delegation_test.go
++++ b/server/delegation/delegation_test.go
+@@ -102,3 +102,33 @@ func TestConsentGroupsByTool(t *testing.T) {
+ 	require.Len(t, unknown.Tools, 1)
+ 	require.Equal(t, ConsentTool{Name: "elsewhere", DisplayName: "elsewhere", Other: []string{"x_thing read"}}, unknown.Tools[0])
+ }
++
++// TestConsentBuildAndPush: repository read tokens, deploy keys and Kubernetes
++// objects (PathOps BUILD_AND_PUSH) are described, not left as "other".
++func TestConsentBuildAndPush(t *testing.T) {
++	p, err := NewPolicy(validConfig())
++	require.NoError(t, err)
++	got := p.Consent(&Plan{Delegate: "pathops-tenant-control-plane", Details: []byte(`[
++		{"type":"pathops_repository_token","tool":"forgejo","owner":"o","repository":"a","name":"pathops-resolution-x",
++		 "scopes":["read:repository"],"actions":["create","revoke"]},
++		{"type":"pathops_deploy_key","tool":"forgejo","owner":"o","repository":"a","title":"pathops-checkout-x","read_only":true,
++		 "actions":["configure"]},
++		{"type":"pathops_kubernetes_resource","tool":"kubernetes","application":"x","apiGroup":"","resource":"namespaces",
++		 "name":"a-ci","actions":["create"]},
++		{"type":"pathops_kubernetes_resource","tool":"kubernetes","application":"x","apiGroup":"rbac.authorization.k8s.io",
++		 "resource":"rolebindings","namespace":"a-ci","name":"build-and-push-trigger","actions":["create"]}]`)})
++	require.Len(t, got.Tools, 2)
++	fj, k8s := got.Tools[0], got.Tools[1]
++	require.Equal(t, []ConsentRepositoryToken{{Repository: "o/a", Name: "pathops-resolution-x", Scopes: []string{"read:repository"},
++		Actions: []ConsentAction{{"create", "create this access token, readable only for this repository"},
++			{"revoke", "delete an earlier access token of this exact name"}}}}, fj.RepositoryTokens)
++	require.Equal(t, []ConsentDeployKey{{Repository: "o/a", Title: "pathops-checkout-x", ReadOnly: true,
++		Actions: []ConsentAction{{"configure", "add this read-only deploy key"}}}}, fj.DeployKeys)
++	require.Empty(t, fj.Other)
++	require.Equal(t, []ConsentKubernetesResource{
++		{Kind: "namespaces", Name: "a-ci", Application: "x", Actions: []ConsentAction{{"create", "create this object"}}},
++		{Kind: "rbac.authorization.k8s.io/rolebindings", Name: "a-ci/build-and-push-trigger", Application: "x",
++			Actions: []ConsentAction{{"create", "create this object"}}},
++	}, k8s.KubernetesResources)
++	require.Empty(t, k8s.Other)
++}
+diff --git a/server/delegation/plan.go b/server/delegation/plan.go
+index b560be1..3c05ace 100644
+--- a/server/delegation/plan.go
++++ b/server/delegation/plan.go
+@@ -351,10 +351,40 @@ type ConsentTool struct {
+ 	URL, IconURL string
+ 	Repositories []ConsentRepository
+ 	Webhooks     []ConsentWebhook
++	// RepositoryTokens and DeployKeys are a repository's read-only
++	// credentials (PathOps BUILD_AND_PUSH); KubernetesResources the
++	// Kubernetes objects the operation creates.
++	RepositoryTokens    []ConsentRepositoryToken
++	DeployKeys          []ConsentDeployKey
++	KubernetesResources []ConsentKubernetesResource
+ 	// Other are details of other types, described generically.
+ 	Other []string
+ }
+ 
++// ConsentRepositoryToken is one repository token detail: an access token of
++// the user, readable only for one repository.
++type ConsentRepositoryToken struct {
++	Repository, Name string
++	Scopes           []string
++	Actions          []ConsentAction
++}
++
++// ConsentDeployKey is one deploy key detail.
++type ConsentDeployKey struct {
++	Repository, Title string
++	ReadOnly          bool
++	Actions           []ConsentAction
++}
++
++// ConsentKubernetesResource is one Kubernetes object detail.
++type ConsentKubernetesResource struct {
++	// Kind is the API group and resource ("namespaces",
++	// "rbac.authorization.k8s.io/rolebindings"); Name is namespace/name for a
++	// namespaced object.
++	Kind, Name, Application string
++	Actions                 []ConsentAction
++}
++
+ // ConsentRepository is one repository detail.
+ type ConsentRepository struct {
+ 	Name    string
+@@ -378,13 +408,35 @@ type ConsentAction struct {
+ var actionMeanings = map[string]string{
+ 	"create":    "create it as a private repository",
+ 	"seed":      "write the template's initial content to it",
++	"read":      "read its content",
+ 	"configure": "configure it",
+ }
+ 
++// Meanings of actions that differ by detail type.
++var typeActionMeanings = map[string]map[string]string{
++	"pathops_repository_token": {
++		"create": "create this access token, readable only for this repository",
++		"revoke": "delete an earlier access token of this exact name",
++	},
++	"pathops_deploy_key": {
++		"configure": "add this read-only deploy key",
++	},
++	"pathops_kubernetes_resource": {
++		"create": "create this object",
++	},
++}
++
+ func consentActions(actions []string) []ConsentAction {
++	return typedConsentActions("", actions)
++}
++
++func typedConsentActions(typ string, actions []string) []ConsentAction {
+ 	out := make([]ConsentAction, 0, len(actions))
+ 	for _, a := range actions {
+-		m := actionMeanings[a]
++		m := typeActionMeanings[typ][a]
++		if m == "" {
++			m = actionMeanings[a]
++		}
+ 		if m == "" {
+ 			m = a
+ 		}
+@@ -436,6 +488,23 @@ func (p *Policy) Consent(pl *Plan) Consent {
+ 		case "pathops_webhook":
+ 			t.Webhooks = append(t.Webhooks, ConsentWebhook{Repository: repo, URL: str("url"),
+ 				Events: eventList(m["events"]), Actions: consentActions(dt.Actions)})
++		case "pathops_repository_token":
++			t.RepositoryTokens = append(t.RepositoryTokens, ConsentRepositoryToken{Repository: repo, Name: str("name"),
++				Scopes: eventList(m["scopes"]), Actions: typedConsentActions(dt.Type, dt.Actions)})
++		case "pathops_deploy_key":
++			readOnly, _ := m["read_only"].(bool)
++			t.DeployKeys = append(t.DeployKeys, ConsentDeployKey{Repository: repo, Title: str("title"), ReadOnly: readOnly,
++				Actions: typedConsentActions(dt.Type, dt.Actions)})
++		case "pathops_kubernetes_resource":
++			kind, name := str("resource"), str("name")
++			if g := str("apiGroup"); g != "" {
++				kind = g + "/" + kind
++			}
++			if ns := str("namespace"); ns != "" {
++				name = ns + "/" + name
++			}
++			t.KubernetesResources = append(t.KubernetesResources, ConsentKubernetesResource{Kind: kind, Name: name,
++				Application: str("application"), Actions: typedConsentActions(dt.Type, dt.Actions)})
+ 		default:
+ 			t.Other = append(t.Other, describe(dt, m))
+ 		}
+diff --git a/server/templates/templates_test.go b/server/templates/templates_test.go
+index eb2d54b..627f5a5 100644
+--- a/server/templates/templates_test.go
++++ b/server/templates/templates_test.go
+@@ -1,6 +1,14 @@
+ package templates
+ 
+-import "testing"
++import (
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"strings"
++	"testing"
++
++	"github.com/dexidp/dex/server/delegation"
++)
+ 
+ func TestRelativeURL(t *testing.T) {
+ 	tests := []struct {
+@@ -104,3 +112,33 @@ func TestSortConnectorsKeepsCaseVariantsStable(t *testing.T) {
+ 		t.Fatalf("names differing only in case were reordered: %q, %q", connectors[0].ID, connectors[1].ID)
+ 	}
+ }
++
++// The bundled consent screen shows BUILD_AND_PUSH credentials and Kubernetes
++// objects.
++func TestDelegationTemplateBuildAndPush(t *testing.T) {
++	_, _, _, tmpls, err := LoadWebConfig(Config{WebFS: os.DirFS("../../web"), Issuer: "dex"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	page := DelegationPage{User: "gaston", Delegate: "PathOps Tenant Control Plane", Consent: delegation.Consent{Tools: []delegation.ConsentTool{
++		{Name: "forgejo", DisplayName: "Forgejo",
++			RepositoryTokens: []delegation.ConsentRepositoryToken{{Repository: "gaston/app-a", Name: "pathops-resolution-x", Scopes: []string{"read:repository"}}},
++			DeployKeys:       []delegation.ConsentDeployKey{{Repository: "gaston/app-a", Title: "pathops-checkout-x", ReadOnly: true}}},
++		{Name: "kubernetes", DisplayName: "Kubernetes",
++			KubernetesResources: []delegation.ConsentKubernetesResource{{Kind: "namespaces", Name: "app-a-ci"}}},
++	}}}
++	rr := httptest.NewRecorder()
++	if err := tmpls.Delegation(httptest.NewRequest(http.MethodGet, "/approval", nil), rr, page); err != nil {
++		t.Fatal(err)
++	}
++	body := rr.Body.String()
++	for _, want := range []string{"Repository read tokens", "pathops-resolution-x", "read:repository",
++		"Deploy keys", "pathops-checkout-x", "read-only", "Kubernetes objects", "app-a-ci", "<code>namespaces</code>"} {
++		if !strings.Contains(body, want) {
++			t.Errorf("the consent screen does not show %q", want)
++		}
++	}
++	if strings.Contains(body, "Other resources") {
++		t.Error("BUILD_AND_PUSH details are shown as other resources")
++	}
++}
+diff --git a/web/templates/delegation.html b/web/templates/delegation.html
+index 9379175..d2776c9 100644
+--- a/web/templates/delegation.html
++++ b/web/templates/delegation.html
+@@ -103,6 +103,60 @@
+       </div>
+       {{ end }}
+ 
++      {{ with .RepositoryTokens }}
++      <div class="pc-section">
++        <h3>Repository read tokens</h3>
++        <ul class="pc-list">
++          {{ range . }}
++          <li class="pc-item">
++            <dl class="pc-facts">
++              <dt>Repository</dt><dd><code class="pc-name">{{ .Repository }}</code></dd>
++              <dt>Token</dt><dd><code>{{ .Name }}</code></dd>
++              <dt>Scopes</dt><dd><span class="pc-chips">{{ range .Scopes }}<span class="pc-chip">{{ . }}</span>{{ end }}</span></dd>
++              <dt>Actions</dt><dd><span class="pc-chips">{{ range .Actions }}<span class="pc-chip" title="{{ .Meaning }}">{{ .Name }}</span>{{ end }}</span></dd>
++            </dl>
++            <p class="pc-note">An access token of your account that can only read this repository.</p>
++          </li>
++          {{ end }}
++        </ul>
++      </div>
++      {{ end }}
++
++      {{ with .DeployKeys }}
++      <div class="pc-section">
++        <h3>Deploy keys</h3>
++        <ul class="pc-list">
++          {{ range . }}
++          <li class="pc-item">
++            <dl class="pc-facts">
++              <dt>Repository</dt><dd><code class="pc-name">{{ .Repository }}</code></dd>
++              <dt>Title</dt><dd><code>{{ .Title }}</code></dd>
++              <dt>Access</dt><dd>{{ if .ReadOnly }}read-only{{ else }}<strong>read and write</strong>{{ end }}</dd>
++              <dt>Actions</dt><dd><span class="pc-chips">{{ range .Actions }}<span class="pc-chip" title="{{ .Meaning }}">{{ .Name }}</span>{{ end }}</span></dd>
++            </dl>
++          </li>
++          {{ end }}
++        </ul>
++      </div>
++      {{ end }}
++
++      {{ with .KubernetesResources }}
++      <div class="pc-section">
++        <h3>Kubernetes objects</h3>
++        <ul class="pc-list">
++          {{ range . }}
++          <li class="pc-item">
++            <div class="pc-item-head">
++              <code class="pc-name">{{ .Name }}</code>
++              <span class="pc-chips">{{ range .Actions }}<span class="pc-chip" title="{{ .Meaning }}">{{ .Name }}</span>{{ end }}</span>
++            </div>
++            <p class="pc-note"><code>{{ .Kind }}</code></p>
++          </li>
++          {{ end }}
++        </ul>
++      </div>
++      {{ end }}
++
+       {{ with .Other }}
+       <div class="pc-section">
+         <h3>Other resources</h3>
+-- 
+2.53.0
+

@@ -22,6 +22,11 @@ Current patch set:
 - `0004`: `sessions.cookieEncryptionKeyFromEnv`: the session cookie
   encryption key from an environment variable (a Kubernetes Secret) instead of
   the configuration file, like `hashFromEnv` of static passwords.
+- `0005`: the consent screen describes the BUILD_AND_PUSH details (PathOps
+  Decision 0056): Forgejo repository read tokens and read-only deploy keys,
+  and the Kubernetes objects of an Application's CI namespace.
+- `0006`: opt-in `registryTokens`: short-lived registry tokens for Application
+  build workloads, by token exchange. See [Registry tokens](#registry-tokens).
 
 Long-term goal: remove the functional patch once equivalent functionality is
 available upstream, and consume official Dex images again.
@@ -165,6 +170,46 @@ delegate checks both and their binding. It authenticates nobody: Dex's
 userinfo and introspection refuse it, its audience is no tool's, and it is
 never a derivation subject (that is the grant handle, for the delegate only).
 Delegation requires a signer that can type tokens (the local signer).
+
+### Registry tokens
+
+Patch `0006` lets an Application's build ServiceAccount (`<app>-build` in
+`<app>-ci`) exchange its projected Kubernetes token for a registry token of
+its own Application's repository only:
+
+```yaml
+registryTokens:
+  clients: [zot]                      # clients that may ask
+  connector: k8s-cell                 # the Kubernetes workload connector
+  issuer: https://dex.example.org/registry
+  audience: zot-registry
+  signingKeyFile: /etc/dex/registry/registry.key   # Ed25519, PEM PKCS#8
+  keyID: registry-1
+  validFor: 5m                        # default and maximum
+  repositoryPrefix: apps/             # default
+```
+
+```bash
+curl -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange -d client_id=zot \
+  -d connector_id=k8s-cell -d subject_token_type=urn:ietf:params:oauth:token-type:id_token \
+  -d requested_token_type=urn:pathops:params:oauth:token-type:registry \
+  --data-urlencode subject_token@/var/run/secrets/pathops/token https://dex.example.org/token
+```
+
+- The token is a JWT signed with the dedicated Ed25519 key (`alg` `EdDSA`,
+  `kid` = `keyID`), never with Dex's OIDC keys, so a registry that also
+  validates Dex OIDC tokens cannot take it for one.
+- Claims: `iss`/`aud` as configured, `sub` the ServiceAccount, `iat`, `nbf`,
+  `exp`, `jti`, `pathops_application`, and the Docker Distribution `access`
+  claim `[{"type":"repository","name":"<prefix><application id>","actions":["pull","push"]}]`.
+- The Application id is read from the Kubernetes API with Dex's own
+  ServiceAccount (it needs `get` on `namespaces` and `serviceaccounts`): the
+  Namespace and the ServiceAccount must carry the same
+  `pathops.io/application-id`, the Namespace `pathops.io/ci=true` and the
+  ServiceAccount `pathops.io/capability=build-and-push`. Those labels must be
+  writable only by PathOps provisioning (Cell admission).
+- Any other client, connector, subject token type or identity gets
+  `access_denied`; the reason is only logged.
 
 ### Login sessions
 

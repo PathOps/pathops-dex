@@ -1,0 +1,853 @@
+From 2ceb65715bbb6d10cf6f28525c0a24dd4cb2042e Mon Sep 17 00:00:00 2001
+From: PathOps <noreply@pathops.dev>
+Date: Sat, 7 Nov 2026 23:49:54 -0300
+Subject: [PATCH 6/6] registry: short-lived registry tokens for Application
+ build workloads
+
+PathOps Decision 0056: an Application's build ServiceAccount
+(<app>-build in <app>-ci) exchanges its projected Kubernetes token at Dex
+(RFC 8693 through the Kubernetes workload connector, requested_token_type
+urn:pathops:params:oauth:token-type:registry) for a registry token: a JWT
+signed with a dedicated Ed25519 key (never Dex's OIDC keys), with its own
+issuer and audience, at most 5 minutes, carrying the Docker Distribution
+"access" claim for exactly <prefix><application id> with pull and push.
+
+The Application id comes from the Kubernetes API, read with Dex's own
+ServiceAccount: the workload's Namespace and ServiceAccount must carry the
+same pathops.io/application-id label, the Namespace pathops.io/ci=true and
+the ServiceAccount pathops.io/capability=build-and-push. Only the
+configured clients and connector may ask, only with an ID token. Any other
+identity is refused (access_denied), with the reason logged only.
+
+Configuration (opt-in; without it nothing changes):
+
+  registryTokens:
+    clients: [zot]
+    connector: k8s-cell
+    issuer: https://dex.example.org/registry
+    audience: zot-registry
+    signingKeyFile: /etc/dex/registry/registry.key
+    keyID: registry-1
+    validFor: 5m
+    repositoryPrefix: apps/
+---
+ cmd/dex/config.go                            |   5 +
+ cmd/dex/serve.go                             |  11 +
+ server/config.go                             |   5 +
+ server/grants/grants.go                      |   6 +-
+ server/grants/tokenexchange.go               |  39 +++
+ server/grants/tokenexchange_registry_test.go |  65 ++++
+ server/registry/registry.go                  | 306 +++++++++++++++++++
+ server/registry/registry_test.go             | 155 ++++++++++
+ server/server.go                             |   1 +
+ server/server_grant_tokenexchange_test.go    |  40 +++
+ 10 files changed, 632 insertions(+), 1 deletion(-)
+ create mode 100644 server/grants/tokenexchange_registry_test.go
+ create mode 100644 server/registry/registry.go
+ create mode 100644 server/registry/registry_test.go
+
+diff --git a/cmd/dex/config.go b/cmd/dex/config.go
+index 6a45554..aa56fde 100644
+--- a/cmd/dex/config.go
++++ b/cmd/dex/config.go
+@@ -19,6 +19,7 @@ import (
+ 	"github.com/dexidp/dex/server"
+ 	"github.com/dexidp/dex/server/connectors"
+ 	"github.com/dexidp/dex/server/delegation"
++	"github.com/dexidp/dex/server/registry"
+ 	"github.com/dexidp/dex/server/signer"
+ 	"github.com/dexidp/dex/storage"
+ 	"github.com/dexidp/dex/storage/ent"
+@@ -79,6 +80,10 @@ type Config struct {
+ 
+ 	// Delegation enables PathOps operation-scoped delegated authorization.
+ 	Delegation *delegation.Config `json:"delegation"`
++
++	// RegistryTokens enables PathOps registry tokens for Application build
++	// workloads (token exchange).
++	RegistryTokens *registry.Config `json:"registryTokens"`
+ }
+ 
+ // MFAConfig holds multi-factor authentication settings.
+diff --git a/cmd/dex/serve.go b/cmd/dex/serve.go
+index bf755c8..c5c1197 100644
+--- a/cmd/dex/serve.go
++++ b/cmd/dex/serve.go
+@@ -45,6 +45,7 @@ import (
+ 	"github.com/dexidp/dex/server/connectors"
+ 	"github.com/dexidp/dex/server/delegation"
+ 	"github.com/dexidp/dex/server/mfa"
++	"github.com/dexidp/dex/server/registry"
+ 	"github.com/dexidp/dex/server/session"
+ 	"github.com/dexidp/dex/server/signer"
+ 	"github.com/dexidp/dex/server/tokens"
+@@ -413,6 +414,16 @@ func runServe(options serveOptions) error {
+ 			"grants_valid_for", policy.GrantsValidFor(), "tokens_valid_for", policy.TokensValidFor())
+ 	}
+ 
++	if c.RegistryTokens != nil {
++		issuer, err := registry.NewIssuer(*c.RegistryTokens)
++		if err != nil {
++			return fmt.Errorf("invalid registryTokens config: %v", err)
++		}
++		serverConfig.RegistryTokens = issuer
++		logger.Info("config registry tokens", "clients", c.RegistryTokens.Clients, "connector", c.RegistryTokens.Connector,
++			"issuer", c.RegistryTokens.Issuer, "audience", c.RegistryTokens.Audience)
++	}
++
+ 	if c.Expiry.AuthRequests != "" {
+ 		authRequests, err := time.ParseDuration(c.Expiry.AuthRequests)
+ 		if err != nil {
+diff --git a/server/config.go b/server/config.go
+index bd9174b..5017019 100644
+--- a/server/config.go
++++ b/server/config.go
+@@ -19,6 +19,7 @@ import (
+ 	"github.com/dexidp/dex/server/delegation"
+ 	"github.com/dexidp/dex/server/mfa"
+ 	"github.com/dexidp/dex/server/oauth2"
++	"github.com/dexidp/dex/server/registry"
+ 	"github.com/dexidp/dex/server/session"
+ 	"github.com/dexidp/dex/server/signer"
+ 	"github.com/dexidp/dex/server/templates"
+@@ -65,6 +66,10 @@ type Config struct {
+ 	// signed Authorization Plans, operation grants). Nil: disabled.
+ 	Delegation *delegation.Policy
+ 
++	// RegistryTokens issues PathOps registry tokens to Application build
++	// workloads by token exchange. Nil: disabled.
++	RegistryTokens *registry.Issuer
++
+ 	// If enabled, the connectors selection page will always be shown even if there's only one
+ 	AlwaysShowLoginScreen bool
+ 
+diff --git a/server/grants/grants.go b/server/grants/grants.go
+index 1259e05..0d8f782 100644
+--- a/server/grants/grants.go
++++ b/server/grants/grants.go
+@@ -16,6 +16,7 @@ import (
+ 	"github.com/dexidp/dex/server/delegation"
+ 	"github.com/dexidp/dex/server/internal"
+ 	"github.com/dexidp/dex/server/oauth2"
++	"github.com/dexidp/dex/server/registry"
+ 	"github.com/dexidp/dex/server/router"
+ 	"github.com/dexidp/dex/server/session"
+ 	"github.com/dexidp/dex/server/signer"
+@@ -175,6 +176,9 @@ type Handler struct {
+ 	Delegation *delegation.Policy
+ 	Signer     signer.Signer
+ 	IssuerURL  string
++	// RegistryTokens issues PathOps registry tokens by token exchange (nil:
++	// disabled).
++	RegistryTokens *registry.Issuer
+ 
+ 	grants map[string]Grant
+ }
+@@ -195,7 +199,7 @@ func (h *Handler) Mount(m router.Mux) {
+ 	h.register(h.SupportedGrantTypes,
+ 		&clientCredentials{issuer: h.Issuer, logger: h.Logger},
+ 		&password{issuer: h.Issuer, logger: h.Logger, connectorID: h.PasswordConnector},
+-		&tokenExchange{issuer: h.Issuer, logger: h.Logger},
++		&tokenExchange{issuer: h.Issuer, logger: h.Logger, registry: h.RegistryTokens},
+ 		&authorizationCode{issuer: h.Issuer, storage: h.Storage, connectors: h.Connectors, now: h.Now, logger: h.Logger,
+ 			delegation: h.Delegation, signer: h.Signer, issuerURL: h.IssuerURL},
+ 		&refresh{storage: h.Storage, issuer: h.Issuer, policy: h.RefreshPolicy, sessions: h.Sessions, sessionsEnabled: h.SessionsEnabled, now: h.Now, logger: h.Logger},
+diff --git a/server/grants/tokenexchange.go b/server/grants/tokenexchange.go
+index 256fcfb..e251767 100644
+--- a/server/grants/tokenexchange.go
++++ b/server/grants/tokenexchange.go
+@@ -2,6 +2,7 @@ package grants
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"log/slog"
+ 	"net/http"
+ 	"time"
+@@ -9,6 +10,7 @@ import (
+ 	"github.com/dexidp/dex/connector"
+ 	"github.com/dexidp/dex/server/connectors"
+ 	"github.com/dexidp/dex/server/oauth2"
++	"github.com/dexidp/dex/server/registry"
+ 	"github.com/dexidp/dex/server/tokens"
+ 	"github.com/dexidp/dex/storage"
+ )
+@@ -21,6 +23,8 @@ import (
+ type tokenExchange struct {
+ 	issuer *tokens.Issuer
+ 	logger *slog.Logger
++	// registry issues PathOps registry tokens (nil: disabled).
++	registry *registry.Issuer
+ }
+ 
+ func (g *tokenExchange) GrantType() string {
+@@ -75,6 +79,10 @@ func (g *tokenExchange) Authorize(ctx context.Context, req *Request, client stor
+ 		"email", email, "groups", identity.Groups,
+ 		"subject_token_type", req.SubjectTokenType, "requested_token_type", reqType)
+ 
++	if reqType == registry.TokenType {
++		return g.registryToken(ctx, req, client, identity.UserID)
++	}
++
+ 	auth := tokens.Authorization{
+ 		Client:      client,
+ 		Claims:      tokens.ClaimsFromIdentity(identity),
+@@ -109,6 +117,37 @@ func (g *tokenExchange) Authorize(ctx context.Context, req *Request, client stor
+ 	}, nil
+ }
+ 
++// registryToken answers a PathOps registry token request: only for the
++// configured clients and workload connector, from an ID token, and only for an
++// Application build ServiceAccount (registry.Issuer). A refusal says nothing
++// about why; the log does.
++func (g *tokenExchange) registryToken(ctx context.Context, req *Request, client storage.Client, subject string) (Responder, error) {
++	if g.registry == nil {
++		return nil, &oauth2.Error{Type: oauth2.RequestNotSupported, Description: "Invalid requested_token_type.", Status: http.StatusBadRequest}
++	}
++	if !g.registry.Client(client.ID, req.ConnectorID) || req.SubjectTokenType != oauth2.TokenTypeID {
++		g.logger.WarnContext(ctx, "registry token refused: client, connector or subject token type",
++			"client_id", client.ID, "connector_id", req.ConnectorID, "subject_token_type", req.SubjectTokenType)
++		return nil, &oauth2.Error{Type: oauth2.AccessDenied, Status: http.StatusForbidden}
++	}
++	token, expiry, err := g.registry.Issue(ctx, subject)
++	if errors.Is(err, registry.ErrDenied) {
++		g.logger.WarnContext(ctx, "registry token refused", "user_id", subject, "err", err)
++		return nil, &oauth2.Error{Type: oauth2.AccessDenied, Status: http.StatusForbidden}
++	}
++	if err != nil {
++		g.logger.ErrorContext(ctx, "registry token failed", "user_id", subject, "err", err)
++		return nil, &oauth2.Error{Type: oauth2.ServerError, Status: http.StatusInternalServerError}
++	}
++	g.logger.InfoContext(ctx, "registry token issued", "client_id", client.ID, "user_id", subject, "expiry", expiry)
++	return tokens.Response{
++		AccessToken:     token,
++		IssuedTokenType: registry.TokenType,
++		TokenType:       "bearer",
++		ExpiresIn:       int(time.Until(expiry).Seconds()),
++	}, nil
++}
++
+ // requestedTokenType is the requested_token_type param, defaulting to an access
+ // token (RFC 8693 §2.1).
+ func requestedTokenType(req *Request) string {
+diff --git a/server/grants/tokenexchange_registry_test.go b/server/grants/tokenexchange_registry_test.go
+new file mode 100644
+index 0000000..fc7d690
+--- /dev/null
++++ b/server/grants/tokenexchange_registry_test.go
+@@ -0,0 +1,65 @@
++package grants
++
++import (
++	"context"
++	"crypto/ed25519"
++	"crypto/rand"
++	"io"
++	"log/slog"
++	"net/http"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++
++	"github.com/dexidp/dex/server/oauth2"
++	"github.com/dexidp/dex/server/registry"
++	"github.com/dexidp/dex/server/tokens"
++	"github.com/dexidp/dex/storage"
++)
++
++func TestRegistryToken(t *testing.T) {
++	_, key, _ := ed25519.GenerateKey(rand.Reader)
++	const app = "11111111-1111-4111-8111-111111111111"
++	labels := map[string]map[string]string{
++		"app-a-ci":             {registry.LabelApplication: app, registry.LabelCI: "true"},
++		"app-a-ci/app-a-build": {registry.LabelApplication: app, registry.LabelCapability: registry.CapabilityBuild},
++	}
++	iss, err := registry.New(registry.Config{Clients: []string{"zot"}, Connector: "k8s-cell", Issuer: "https://dex.example.org/registry",
++		Audience: "zot", KeyID: "registry-1"}, key, func(_ context.Context, ns, sa string) (map[string]string, error) {
++		k := ns
++		if sa != "" {
++			k += "/" + sa
++		}
++		return labels[k], nil
++	})
++	require.NoError(t, err)
++	g := &tokenExchange{logger: slog.New(slog.NewTextHandler(io.Discard, nil)), registry: iss}
++	req := &Request{ConnectorID: "k8s-cell", SubjectTokenType: oauth2.TokenTypeID}
++	zot := storage.Client{ID: "zot", Public: true}
++
++	out, err := g.registryToken(t.Context(), req, zot, "system:serviceaccount:app-a-ci:app-a-build")
++	require.NoError(t, err)
++	res := out.(tokens.Response)
++	require.Equal(t, registry.TokenType, res.IssuedTokenType)
++	require.NotEmpty(t, res.AccessToken)
++	require.LessOrEqual(t, res.ExpiresIn, 300)
++
++	denied := func(req *Request, client storage.Client, subject string) {
++		t.Helper()
++		_, err := g.registryToken(t.Context(), req, client, subject)
++		var oe *oauth2.Error
++		require.ErrorAs(t, err, &oe)
++		require.Equal(t, oauth2.AccessDenied, oe.Type)
++		require.Equal(t, http.StatusForbidden, oe.Status)
++	}
++	denied(req, storage.Client{ID: "pathops-cli"}, "system:serviceaccount:app-a-ci:app-a-build")
++	denied(&Request{ConnectorID: "local", SubjectTokenType: oauth2.TokenTypeID}, zot, "system:serviceaccount:app-a-ci:app-a-build")
++	denied(&Request{ConnectorID: "k8s-cell", SubjectTokenType: oauth2.TokenTypeAccess}, zot, "system:serviceaccount:app-a-ci:app-a-build")
++	denied(req, zot, "system:serviceaccount:app-a-ci:default")
++
++	// Disabled: the token type is not supported.
++	_, err = (&tokenExchange{logger: g.logger}).registryToken(t.Context(), req, zot, "system:serviceaccount:app-a-ci:app-a-build")
++	var oe *oauth2.Error
++	require.ErrorAs(t, err, &oe)
++	require.Equal(t, oauth2.RequestNotSupported, oe.Type)
++}
+diff --git a/server/registry/registry.go b/server/registry/registry.go
+new file mode 100644
+index 0000000..be33d54
+--- /dev/null
++++ b/server/registry/registry.go
+@@ -0,0 +1,306 @@
++// Package registry is the PathOps extension that issues registry tokens to
++// Application build workloads (PathOps Decision 0056).
++//
++// An Application's build ServiceAccount (<app>-build in <app>-ci) exchanges
++// its projected Kubernetes token at Dex (RFC 8693, through the Kubernetes
++// workload connector) for a short-lived registry token:
++//
++//	requested_token_type = urn:pathops:params:oauth:token-type:registry
++//
++// The token is a JWT signed with a dedicated Ed25519 key (never Dex's OIDC
++// keys, so the registry's OIDC validation cannot accept it) and carries the
++// Docker Distribution "access" claim for exactly one repository, the
++// Application's, with pull and push:
++//
++//	{"iss": <registry issuer>, "sub": "system:serviceaccount:<app>-ci:<app>-build",
++//	 "aud": <registry audience>, "iat", "nbf", "exp" (at most 5 minutes), "jti",
++//	 "pathops_application": <application id>,
++//	 "access": [{"type": "repository", "name": "<prefix><application id>", "actions": ["pull", "push"]}]}
++//
++// The Application id comes from the Kubernetes API, not from the request: the
++// workload's Namespace and ServiceAccount must both carry the same
++// pathops.io/application-id label, the Namespace pathops.io/ci=true and the
++// ServiceAccount pathops.io/capability=build-and-push. Those labels are
++// written only by PathOps provisioning (protected by Cell admission). Any
++// other ServiceAccount gets no registry authority.
++package registry
++
++import (
++	"context"
++	"crypto/ed25519"
++	"crypto/rand"
++	"crypto/tls"
++	"crypto/x509"
++	"encoding/base64"
++	"encoding/hex"
++	"encoding/json"
++	"encoding/pem"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"os"
++	"regexp"
++	"slices"
++	"strings"
++	"time"
++)
++
++// TokenType is the RFC 8693 requested_token_type of a registry token.
++const TokenType = "urn:pathops:params:oauth:token-type:registry"
++
++// Labels the workload's Namespace and ServiceAccount must carry.
++const (
++	LabelApplication = "pathops.io/application-id"
++	LabelCI          = "pathops.io/ci"
++	LabelCapability  = "pathops.io/capability"
++	CapabilityBuild  = "build-and-push"
++)
++
++// Config is the "registryTokens" section of the Dex configuration.
++type Config struct {
++	// Clients are the OAuth clients that may request registry tokens.
++	Clients []string `json:"clients"`
++	// Connector is the Kubernetes workload connector whose identities may
++	// get registry tokens.
++	Connector string `json:"connector"`
++	// Issuer is the tokens' "iss" (not Dex's issuer) and Audience their "aud".
++	Issuer   string `json:"issuer"`
++	Audience string `json:"audience"`
++	// SigningKeyFile is the Ed25519 private key (PEM, PKCS#8); KeyID its "kid".
++	SigningKeyFile string `json:"signingKeyFile"`
++	KeyID          string `json:"keyID"`
++	// ValidFor is the tokens' lifetime (default and maximum 5m).
++	ValidFor string `json:"validFor"`
++	// RepositoryPrefix prefixes the Application id (default "apps/").
++	RepositoryPrefix string `json:"repositoryPrefix"`
++}
++
++// Issuer issues registry tokens.
++type Issuer struct {
++	clients   []string
++	connector string
++	issuer    string
++	audience  string
++	key       ed25519.PrivateKey
++	keyID     string
++	ttl       time.Duration
++	prefix    string
++	// Lookup returns the labels of a Namespace (sa == "") or of a
++	// ServiceAccount; ErrNotFound when it does not exist.
++	Lookup func(ctx context.Context, namespace, sa string) (map[string]string, error)
++	Now    func() time.Time
++}
++
++// ErrNotFound: the Kubernetes object does not exist.
++var ErrNotFound = errors.New("not found")
++
++// ErrDenied: the identity has no registry authority. The reason is logged,
++// never returned to the client.
++var ErrDenied = errors.New("registry token denied")
++
++var (
++	identifier = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
++	dnsLabel   = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
++	uuid       = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
++	prefix     = regexp.MustCompile(`^([a-z0-9]+(?:[._-][a-z0-9]+)*/)+$`)
++)
++
++// NewIssuer validates c, loads its key and reads labels from the in-cluster
++// Kubernetes API as Dex's own ServiceAccount.
++func NewIssuer(c Config) (*Issuer, error) {
++	raw, err := os.ReadFile(c.SigningKeyFile)
++	if err != nil {
++		return nil, fmt.Errorf("registryTokens.signingKeyFile: %v", err)
++	}
++	block, _ := pem.Decode(raw)
++	if block == nil || block.Type != "PRIVATE KEY" {
++		return nil, errors.New("registryTokens.signingKeyFile is not a PEM PRIVATE KEY")
++	}
++	k, err := x509.ParsePKCS8PrivateKey(block.Bytes)
++	key, ok := k.(ed25519.PrivateKey)
++	if err != nil || !ok {
++		return nil, errors.New("registryTokens.signingKeyFile is not an Ed25519 key")
++	}
++	i, err := New(c, key, nil)
++	if err != nil {
++		return nil, err
++	}
++	kc, err := inCluster()
++	if err != nil {
++		return nil, fmt.Errorf("registryTokens: the Kubernetes API: %v", err)
++	}
++	i.Lookup = kc.labels
++	return i, nil
++}
++
++// New validates c (its SigningKeyFile is not read) and returns an Issuer
++// signing with key and reading labels with lookup.
++func New(c Config, key ed25519.PrivateKey, lookup func(ctx context.Context, namespace, sa string) (map[string]string, error)) (*Issuer, error) {
++	i := &Issuer{clients: c.Clients, connector: c.Connector, issuer: c.Issuer, audience: c.Audience, keyID: c.KeyID,
++		key: key, ttl: 5 * time.Minute, prefix: c.RepositoryPrefix, Lookup: lookup, Now: time.Now}
++	if len(c.Clients) == 0 || slices.ContainsFunc(c.Clients, func(s string) bool { return !identifier.MatchString(s) }) {
++		return nil, errors.New("registryTokens.clients must name client ids")
++	}
++	if !identifier.MatchString(c.Connector) || !identifier.MatchString(c.KeyID) || c.Audience == "" {
++		return nil, errors.New("registryTokens.connector, keyID and audience are required")
++	}
++	if u, err := url.Parse(c.Issuer); err != nil || u.Scheme != "https" || u.Host == "" {
++		return nil, errors.New("registryTokens.issuer must be an https URL")
++	}
++	if c.ValidFor != "" {
++		d, err := time.ParseDuration(c.ValidFor)
++		if err != nil || d <= 0 || d > 5*time.Minute {
++			return nil, errors.New("registryTokens.validFor must be positive and at most 5m")
++		}
++		i.ttl = d
++	}
++	if i.prefix == "" {
++		i.prefix = "apps/"
++	}
++	if !prefix.MatchString(i.prefix) {
++		return nil, fmt.Errorf("registryTokens.repositoryPrefix %q is not a repository path prefix ending in /", i.prefix)
++	}
++	if len(key) != ed25519.PrivateKeySize {
++		return nil, errors.New("registryTokens: an Ed25519 signing key is required")
++	}
++	return i, nil
++}
++
++// Client reports whether clientID may request registry tokens through
++// connectorID.
++func (i *Issuer) Client(clientID, connectorID string) bool {
++	return connectorID == i.connector && slices.Contains(i.clients, clientID)
++}
++
++// Issue returns a registry token for the workload subject (the connector's
++// verified "sub": system:serviceaccount:<namespace>:<name>).
++func (i *Issuer) Issue(ctx context.Context, subject string) (string, time.Time, error) {
++	app, err := i.application(ctx, subject)
++	if err != nil {
++		return "", time.Time{}, err
++	}
++	now := i.Now().UTC().Truncate(time.Second)
++	exp := now.Add(i.ttl)
++	jti := make([]byte, 16)
++	if _, err := rand.Read(jti); err != nil {
++		return "", time.Time{}, err
++	}
++	header, _ := json.Marshal(map[string]string{"alg": "EdDSA", "typ": "JWT", "kid": i.keyID})
++	claims, err := json.Marshal(map[string]any{
++		"iss": i.issuer, "sub": subject, "aud": i.audience,
++		"iat": now.Unix(), "nbf": now.Unix(), "exp": exp.Unix(), "jti": hex.EncodeToString(jti),
++		"pathops_application": app,
++		"access":              []map[string]any{{"type": "repository", "name": i.prefix + app, "actions": []string{"pull", "push"}}},
++	})
++	if err != nil {
++		return "", time.Time{}, err
++	}
++	in := base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(claims)
++	return in + "." + base64.RawURLEncoding.EncodeToString(ed25519.Sign(i.key, []byte(in))), exp, nil
++}
++
++// application is the Application id of a build workload, or ErrDenied.
++func (i *Issuer) application(ctx context.Context, subject string) (string, error) {
++	parts := strings.Split(subject, ":")
++	if len(parts) != 4 || parts[0] != "system" || parts[1] != "serviceaccount" {
++		return "", fmt.Errorf("%w: %q is not a ServiceAccount", ErrDenied, subject)
++	}
++	ns, sa := parts[2], parts[3]
++	app, ok := strings.CutSuffix(ns, "-ci")
++	if !ok || !dnsLabel.MatchString(ns) || app == "" || sa != app+"-build" {
++		return "", fmt.Errorf("%w: %s is not an Application build ServiceAccount (<app>-build in <app>-ci)", ErrDenied, subject)
++	}
++	nsLabels, err := i.Lookup(ctx, ns, "")
++	if err != nil {
++		return "", fmt.Errorf("%w: Namespace %s: %v", ErrDenied, ns, err)
++	}
++	saLabels, err := i.Lookup(ctx, ns, sa)
++	if err != nil {
++		return "", fmt.Errorf("%w: ServiceAccount %s/%s: %v", ErrDenied, ns, sa, err)
++	}
++	id := nsLabels[LabelApplication]
++	switch {
++	case !uuid.MatchString(id):
++		return "", fmt.Errorf("%w: Namespace %s has no Application id", ErrDenied, ns)
++	case nsLabels[LabelCI] != "true":
++		return "", fmt.Errorf("%w: Namespace %s is not a CI namespace", ErrDenied, ns)
++	case saLabels[LabelApplication] != id:
++		return "", fmt.Errorf("%w: ServiceAccount %s/%s is not of Application %s", ErrDenied, ns, sa, id)
++	case saLabels[LabelCapability] != CapabilityBuild:
++		return "", fmt.Errorf("%w: ServiceAccount %s/%s has no %s capability", ErrDenied, ns, sa, CapabilityBuild)
++	}
++	return id, nil
++}
++
++// kube reads object labels from the in-cluster Kubernetes API as Dex's own
++// ServiceAccount (get namespaces and serviceaccounts).
++type kube struct {
++	base      string
++	tokenFile string
++	http      *http.Client
++}
++
++const serviceAccountDir = "/var/run/secrets/kubernetes.io/serviceaccount"
++
++func inCluster() (*kube, error) {
++	host, port := os.Getenv("KUBERNETES_SERVICE_HOST"), os.Getenv("KUBERNETES_SERVICE_PORT")
++	if host == "" || port == "" {
++		return nil, errors.New("not running in a cluster (KUBERNETES_SERVICE_HOST/PORT unset)")
++	}
++	ca, err := os.ReadFile(serviceAccountDir + "/ca.crt")
++	if err != nil {
++		return nil, err
++	}
++	roots := x509.NewCertPool()
++	if !roots.AppendCertsFromPEM(ca) {
++		return nil, errors.New("no certificate in the ServiceAccount CA")
++	}
++	tr := http.DefaultTransport.(*http.Transport).Clone()
++	tr.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
++	return &kube{base: "https://" + strings.Trim(host, "[]") + ":" + port, tokenFile: serviceAccountDir + "/token",
++		http: &http.Client{Timeout: 10 * time.Second, Transport: tr}}, nil
++}
++
++func (k *kube) labels(ctx context.Context, namespace, sa string) (map[string]string, error) {
++	path := "/api/v1/namespaces/" + url.PathEscape(namespace)
++	if sa != "" {
++		path += "/serviceaccounts/" + url.PathEscape(sa)
++	}
++	// The kubelet rotates the projected token: read it for every request.
++	token, err := os.ReadFile(k.tokenFile)
++	if err != nil {
++		return nil, err
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, k.base+path, nil)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
++	req.Header.Set("Accept", "application/json")
++	resp, err := k.http.Do(req)
++	if err != nil {
++		return nil, err
++	}
++	defer resp.Body.Close()
++	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
++	if err != nil {
++		return nil, err
++	}
++	switch {
++	case resp.StatusCode == http.StatusNotFound:
++		return nil, ErrNotFound
++	case resp.StatusCode != http.StatusOK:
++		return nil, fmt.Errorf("GET %s: HTTP %d", path, resp.StatusCode)
++	}
++	var obj struct {
++		Metadata struct {
++			Labels map[string]string `json:"labels"`
++		} `json:"metadata"`
++	}
++	if err := json.Unmarshal(body, &obj); err != nil {
++		return nil, err
++	}
++	return obj.Metadata.Labels, nil
++}
+diff --git a/server/registry/registry_test.go b/server/registry/registry_test.go
+new file mode 100644
+index 0000000..0c068c8
+--- /dev/null
++++ b/server/registry/registry_test.go
+@@ -0,0 +1,155 @@
++package registry
++
++import (
++	"context"
++	"crypto/ed25519"
++	"crypto/rand"
++	"encoding/base64"
++	"encoding/json"
++	"errors"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++const appA = "11111111-1111-4111-8111-111111111111"
++
++var testConfig = Config{Clients: []string{"zot"}, Connector: "k8s-cell", Issuer: "https://dex.example.org/registry",
++	Audience: "zot", KeyID: "registry-1"}
++
++// cluster is a fake Kubernetes: labels by "namespace" or "namespace/sa".
++type cluster map[string]map[string]string
++
++func (c cluster) lookup(_ context.Context, ns, sa string) (map[string]string, error) {
++	k := ns
++	if sa != "" {
++		k += "/" + sa
++	}
++	l, ok := c[k]
++	if !ok {
++		return nil, ErrNotFound
++	}
++	return l, nil
++}
++
++func goodCluster() cluster {
++	return cluster{
++		"app-a-ci":             {LabelApplication: appA, LabelCI: "true"},
++		"app-a-ci/app-a-build": {LabelApplication: appA, LabelCapability: CapabilityBuild},
++	}
++}
++
++func newTestIssuer(t *testing.T, c cluster) (*Issuer, ed25519.PublicKey) {
++	t.Helper()
++	pub, key, err := ed25519.GenerateKey(rand.Reader)
++	require.NoError(t, err)
++	i, err := New(testConfig, key, c.lookup)
++	require.NoError(t, err)
++	return i, pub
++}
++
++func TestIssue(t *testing.T) {
++	i, pub := newTestIssuer(t, goodCluster())
++	now := time.Unix(1_800_000_000, 0)
++	i.Now = func() time.Time { return now }
++	tok, exp, err := i.Issue(t.Context(), "system:serviceaccount:app-a-ci:app-a-build")
++	require.NoError(t, err)
++	require.Equal(t, now.Add(5*time.Minute).UTC(), exp)
++
++	parts := strings.Split(tok, ".")
++	require.Len(t, parts, 3)
++	sig, _ := base64.RawURLEncoding.DecodeString(parts[2])
++	require.True(t, ed25519.Verify(pub, []byte(parts[0]+"."+parts[1]), sig))
++	var header, claims map[string]any
++	raw, _ := base64.RawURLEncoding.DecodeString(parts[0])
++	require.NoError(t, json.Unmarshal(raw, &header))
++	raw, _ = base64.RawURLEncoding.DecodeString(parts[1])
++	require.NoError(t, json.Unmarshal(raw, &claims))
++	require.Equal(t, map[string]any{"alg": "EdDSA", "typ": "JWT", "kid": "registry-1"}, header)
++	require.Equal(t, "https://dex.example.org/registry", claims["iss"])
++	require.Equal(t, "zot", claims["aud"])
++	require.Equal(t, "system:serviceaccount:app-a-ci:app-a-build", claims["sub"])
++	require.Equal(t, appA, claims["pathops_application"])
++	require.EqualValues(t, now.Unix(), claims["iat"])
++	require.EqualValues(t, now.Unix()+300, claims["exp"])
++	require.NotEmpty(t, claims["jti"])
++	require.Equal(t, []any{map[string]any{"type": "repository", "name": "apps/" + appA, "actions": []any{"pull", "push"}}}, claims["access"])
++}
++
++func TestIssueDenied(t *testing.T) {
++	for name, tc := range map[string]struct {
++		subject string
++		change  func(cluster)
++	}{
++		"not a ServiceAccount":          {subject: "alice"},
++		"user that looks like one":      {subject: "system:serviceaccount:app-a-ci"},
++		"another ServiceAccount":        {subject: "system:serviceaccount:app-a-ci:default"},
++		"trigger ServiceAccount":        {subject: "system:serviceaccount:app-a-ci:build-and-push-trigger"},
++		"another Application's name":    {subject: "system:serviceaccount:app-a-ci:app-b-build"},
++		"not a CI namespace":            {subject: "system:serviceaccount:app-a:app-a-build"},
++		"platform namespace":            {subject: "system:serviceaccount:kube-system:app-a-build"},
++		"namespace missing":             {subject: "system:serviceaccount:app-c-ci:app-c-build"},
++		"ServiceAccount missing":        {subject: "system:serviceaccount:app-a-ci:app-a-build", change: func(c cluster) { delete(c, "app-a-ci/app-a-build") }},
++		"namespace without Application": {subject: "system:serviceaccount:app-a-ci:app-a-build", change: func(c cluster) { delete(c["app-a-ci"], LabelApplication) }},
++		"namespace not labeled CI":      {subject: "system:serviceaccount:app-a-ci:app-a-build", change: func(c cluster) { c["app-a-ci"][LabelCI] = "false" }},
++		"ServiceAccount of another app": {subject: "system:serviceaccount:app-a-ci:app-a-build", change: func(c cluster) { c["app-a-ci/app-a-build"][LabelApplication] = "22222222-2222-4222-8222-222222222222" }},
++		"ServiceAccount without label":  {subject: "system:serviceaccount:app-a-ci:app-a-build", change: func(c cluster) { delete(c["app-a-ci/app-a-build"], LabelApplication) }},
++		"ServiceAccount no capability":  {subject: "system:serviceaccount:app-a-ci:app-a-build", change: func(c cluster) { delete(c["app-a-ci/app-a-build"], LabelCapability) }},
++		"Application id not a UUID": {subject: "system:serviceaccount:app-a-ci:app-a-build", change: func(c cluster) {
++			c["app-a-ci"][LabelApplication] = "../b"
++			c["app-a-ci/app-a-build"][LabelApplication] = "../b"
++		}},
++		"Application id with wildcards": {subject: "system:serviceaccount:app-a-ci:app-a-build", change: func(c cluster) {
++			c["app-a-ci"][LabelApplication] = "*"
++			c["app-a-ci/app-a-build"][LabelApplication] = "*"
++		}},
++	} {
++		t.Run(name, func(t *testing.T) {
++			c := goodCluster()
++			if tc.change != nil {
++				tc.change(c)
++			}
++			i, _ := newTestIssuer(t, c)
++			_, _, err := i.Issue(t.Context(), tc.subject)
++			require.ErrorIs(t, err, ErrDenied)
++		})
++	}
++	// A failing Kubernetes API is no authority either.
++	i, _ := newTestIssuer(t, goodCluster())
++	i.Lookup = func(context.Context, string, string) (map[string]string, error) {
++		return nil, errors.New("unavailable")
++	}
++	_, _, err := i.Issue(t.Context(), "system:serviceaccount:app-a-ci:app-a-build")
++	require.ErrorIs(t, err, ErrDenied)
++}
++
++func TestClient(t *testing.T) {
++	i, _ := newTestIssuer(t, goodCluster())
++	require.True(t, i.Client("zot", "k8s-cell"))
++	require.False(t, i.Client("pathops-cli", "k8s-cell"))
++	require.False(t, i.Client("zot", "local"))
++}
++
++func TestNewValidates(t *testing.T) {
++	_, key, _ := ed25519.GenerateKey(rand.Reader)
++	for name, change := range map[string]func(*Config){
++		"no clients":          func(c *Config) { c.Clients = nil },
++		"no connector":        func(c *Config) { c.Connector = "" },
++		"no audience":         func(c *Config) { c.Audience = "" },
++		"no key id":           func(c *Config) { c.KeyID = "" },
++		"http issuer":         func(c *Config) { c.Issuer = "http://dex.example.org/registry" },
++		"lifetime over 5m":    func(c *Config) { c.ValidFor = "6m" },
++		"lifetime negative":   func(c *Config) { c.ValidFor = "-1s" },
++		"prefix without /":    func(c *Config) { c.RepositoryPrefix = "apps" },
++		"prefix with pattern": func(c *Config) { c.RepositoryPrefix = "apps/*/" },
++	} {
++		c := testConfig
++		change(&c)
++		_, err := New(c, key, goodCluster().lookup)
++		require.Error(t, err, name)
++	}
++	_, err := New(testConfig, nil, goodCluster().lookup)
++	require.Error(t, err, "no key")
++}
+diff --git a/server/server.go b/server/server.go
+index 4985756..7eeacc0 100644
+--- a/server/server.go
++++ b/server/server.go
+@@ -257,6 +257,7 @@ func (s *Server) mount(routes router.Mux, c Config, rc resolvedConfig) {
+ 			Delegation:          c.Delegation,
+ 			Signer:              c.Signer,
+ 			IssuerURL:           s.issuerURL.String(),
++			RegistryTokens:      c.RegistryTokens,
+ 		},
+ 		&userinfo.Handler{
+ 			Issuer: s.issuerURL.String(),
+diff --git a/server/server_grant_tokenexchange_test.go b/server/server_grant_tokenexchange_test.go
+index 022de91..2fe3c18 100644
+--- a/server/server_grant_tokenexchange_test.go
++++ b/server/server_grant_tokenexchange_test.go
+@@ -2,6 +2,9 @@ package server
+ 
+ import (
+ 	"bytes"
++	"context"
++	"crypto/ed25519"
++	"crypto/rand"
+ 	"encoding/json"
+ 	"log/slog"
+ 	"net/http"
+@@ -13,6 +16,7 @@ import (
+ 	"github.com/stretchr/testify/require"
+ 
+ 	"github.com/dexidp/dex/server/oauth2"
++	"github.com/dexidp/dex/server/registry"
+ 	"github.com/dexidp/dex/server/tokens"
+ 	"github.com/dexidp/dex/storage"
+ )
+@@ -273,3 +277,39 @@ func TestHandleTokenExchangeAllowedConnectors(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// The registry token type is served only when registry tokens are enabled,
++// and only for build workloads (the mock identity is not one).
++func TestHandleTokenExchangeRegistry(t *testing.T) {
++	for name, tc := range map[string]struct {
++		enabled bool
++		want    int
++	}{
++		"disabled":                  {false, http.StatusBadRequest},
++		"mock user is not workload": {true, http.StatusForbidden},
++	} {
++		t.Run(name, func(t *testing.T) {
++			ctx := t.Context()
++			httpServer, s := newTestServer(t, func(c *Config) {
++				c.Storage.CreateClient(ctx, storage.Client{ID: "zot", Secret: "s"})
++				if tc.enabled {
++					_, key, _ := ed25519.GenerateKey(rand.Reader)
++					iss, err := registry.New(registry.Config{Clients: []string{"zot"}, Connector: "mock",
++						Issuer: "https://dex.example.org/registry", Audience: "zot", KeyID: "registry-1"}, key,
++						func(context.Context, string, string) (map[string]string, error) { return nil, registry.ErrNotFound })
++					require.NoError(t, err)
++					c.RegistryTokens = iss
++				}
++			})
++			defer httpServer.Close()
++			vals := url.Values{"grant_type": {oauth2.GrantTypeTokenExchange}, "connector_id": {"mock"}, "scope": {"openid"},
++				"requested_token_type": {registry.TokenType}, "subject_token_type": {oauth2.TokenTypeID},
++				"subject_token": {"foobar"}, "client_id": {"zot"}, "client_secret": {"s"}}
++			rr := httptest.NewRecorder()
++			req := httptest.NewRequest(http.MethodPost, httpServer.URL+"/token", strings.NewReader(vals.Encode()))
++			req.Header.Set("content-type", "application/x-www-form-urlencoded")
++			s.ServeHTTP(rr, req)
++			require.Equal(t, tc.want, rr.Code, rr.Body.String())
++		})
++	}
++}
+-- 
+2.53.0
+
