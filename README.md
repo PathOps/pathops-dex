@@ -27,6 +27,10 @@ Current patch set:
   and the Kubernetes objects of an Application's CI namespace.
 - `0006`: opt-in `registryTokens`: short-lived registry tokens for Application
   build workloads, by token exchange. See [Registry tokens](#registry-tokens).
+- `0007`: opt-in `artifactTokens`: short-lived Artifact Store tokens for
+  Application artifact identities (PathOps Decision 0061), by the same token
+  exchange and the same workload checks as `0006`. See
+  [Artifact Store tokens](#artifact-store-tokens).
 
 Long-term goal: remove the functional patch once equivalent functionality is
 available upstream, and consume official Dex images again.
@@ -210,6 +214,41 @@ curl -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange -d client_id=
   writable only by PathOps provisioning (Cell admission).
 - Any other client, connector, subject token type or identity gets
   `access_denied`; the reason is only logged.
+
+### Artifact Store tokens
+
+Patch `0007` generalizes `0006` into token profiles: the same workload
+identity checks, Kubernetes label lookup and signing issue a second kind of
+token, for the PathOps Artifact Store. An Application's artifact
+ServiceAccount (`<app>-artifact` in `<app>-ci`) exchanges its Kubernetes token
+for an Artifact Store token of its own Application only:
+
+```yaml
+artifactTokens:
+  clients: [pathops-artifact-store]  # clients that may ask
+  connector: k8s-cell
+  issuer: https://dex.example.org/artifacts
+  audience: pathops-artifact-store
+  signingKeyFile: /etc/dex/artifact/artifact.key   # Ed25519, PEM PKCS#8
+  keyID: artifact-1
+  validFor: 5m                       # default and maximum
+```
+
+The request is the registry one with
+`requested_token_type=urn:pathops:params:oauth:token-type:artifact`.
+
+- The token is a JWT signed with its own Ed25519 key (`alg` `EdDSA`, `kid` =
+  `keyID`), never with Dex's OIDC keys or the registry key.
+- Claims: `iss`/`aud` as configured, `sub` the ServiceAccount, `iat`, `nbf`,
+  `exp`, `jti`, `pathops_application` and `pathops_operations`
+  (`["read", "write"]`). There is no `access` claim: it is not a registry
+  token.
+- The Application id comes from the Kubernetes API as for registry tokens:
+  Namespace and ServiceAccount with the same `pathops.io/application-id`, the
+  Namespace `pathops.io/ci=true`, and the ServiceAccount
+  `pathops.io/capability=artifact-store`.
+- A build ServiceAccount gets no Artifact Store token, and an artifact
+  ServiceAccount gets no registry token.
 
 ### Login sessions
 

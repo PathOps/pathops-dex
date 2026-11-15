@@ -1,0 +1,656 @@
+From 4966af9599c6db203331c360f0c04e65f13a22f3 Mon Sep 17 00:00:00 2001
+From: PathOps <noreply@pathops.dev>
+Date: Sun, 15 Nov 2026 00:10:02 -0300
+Subject: [PATCH 7/7] registry: Artifact Store tokens for Application artifact
+ identities
+
+PathOps Decision 0061: an Application's artifact ServiceAccount
+(<app>-artifact in <app>-ci, capability artifact-store) exchanges its
+Kubernetes token at Dex (RFC 8693 through the Kubernetes workload
+connector, requested_token_type urn:pathops:params:oauth:token-type:artifact)
+for an Artifact Store token: a JWT signed with its own Ed25519 key, with its
+own issuer and audience, at most 5 minutes, carrying pathops_application
+(the Application id read from the Namespace and ServiceAccount labels, as
+for registry tokens) and pathops_operations ["read", "write"].
+
+The registry token issuer is generalized into profiles (section, token
+type, ServiceAccount suffix, capability, extra claims): both kinds share
+the workload identity checks, the Kubernetes label lookup and the signing.
+A build ServiceAccount gets no Artifact Store token and an artifact
+ServiceAccount no registry token. Registry tokens are unchanged.
+
+Configuration (opt-in; without it nothing changes):
+
+  artifactTokens:
+    clients: [pathops-artifact-store]
+    connector: k8s-cell
+    issuer: https://dex.example.org/artifacts
+    audience: pathops-artifact-store
+    signingKeyFile: /etc/dex/artifact/artifact.key
+    keyID: artifact-1
+    validFor: 5m
+---
+ cmd/dex/config.go                            |   4 +
+ cmd/dex/serve.go                             |  10 ++
+ server/config.go                             |   4 +
+ server/grants/grants.go                      |   5 +-
+ server/grants/tokenexchange.go               |  34 +++--
+ server/grants/tokenexchange_registry_test.go |  46 ++++++
+ server/registry/artifact_test.go             | 120 +++++++++++++++
+ server/registry/registry.go                  | 149 +++++++++++++++----
+ server/server.go                             |   1 +
+ 9 files changed, 331 insertions(+), 42 deletions(-)
+ create mode 100644 server/registry/artifact_test.go
+
+diff --git a/cmd/dex/config.go b/cmd/dex/config.go
+index aa56fde..e9327d6 100644
+--- a/cmd/dex/config.go
++++ b/cmd/dex/config.go
+@@ -84,6 +84,10 @@ type Config struct {
+ 	// RegistryTokens enables PathOps registry tokens for Application build
+ 	// workloads (token exchange).
+ 	RegistryTokens *registry.Config `json:"registryTokens"`
++
++	// ArtifactTokens enables PathOps Artifact Store tokens for Application
++	// artifact identities (token exchange).
++	ArtifactTokens *registry.ArtifactConfig `json:"artifactTokens"`
+ }
+ 
+ // MFAConfig holds multi-factor authentication settings.
+diff --git a/cmd/dex/serve.go b/cmd/dex/serve.go
+index c5c1197..2b41c10 100644
+--- a/cmd/dex/serve.go
++++ b/cmd/dex/serve.go
+@@ -424,6 +424,16 @@ func runServe(options serveOptions) error {
+ 			"issuer", c.RegistryTokens.Issuer, "audience", c.RegistryTokens.Audience)
+ 	}
+ 
++	if c.ArtifactTokens != nil {
++		issuer, err := registry.NewArtifactIssuer(*c.ArtifactTokens)
++		if err != nil {
++			return fmt.Errorf("invalid artifactTokens config: %v", err)
++		}
++		serverConfig.ArtifactTokens = issuer
++		logger.Info("config artifact tokens", "clients", c.ArtifactTokens.Clients, "connector", c.ArtifactTokens.Connector,
++			"issuer", c.ArtifactTokens.Issuer, "audience", c.ArtifactTokens.Audience)
++	}
++
+ 	if c.Expiry.AuthRequests != "" {
+ 		authRequests, err := time.ParseDuration(c.Expiry.AuthRequests)
+ 		if err != nil {
+diff --git a/server/config.go b/server/config.go
+index 5017019..df7763a 100644
+--- a/server/config.go
++++ b/server/config.go
+@@ -70,6 +70,10 @@ type Config struct {
+ 	// workloads by token exchange. Nil: disabled.
+ 	RegistryTokens *registry.Issuer
+ 
++	// ArtifactTokens issues PathOps Artifact Store tokens to Application
++	// artifact identities by token exchange. Nil: disabled.
++	ArtifactTokens *registry.Issuer
++
+ 	// If enabled, the connectors selection page will always be shown even if there's only one
+ 	AlwaysShowLoginScreen bool
+ 
+diff --git a/server/grants/grants.go b/server/grants/grants.go
+index 0d8f782..d753c18 100644
+--- a/server/grants/grants.go
++++ b/server/grants/grants.go
+@@ -179,6 +179,9 @@ type Handler struct {
+ 	// RegistryTokens issues PathOps registry tokens by token exchange (nil:
+ 	// disabled).
+ 	RegistryTokens *registry.Issuer
++	// ArtifactTokens issues PathOps Artifact Store tokens by token exchange
++	// (nil: disabled).
++	ArtifactTokens *registry.Issuer
+ 
+ 	grants map[string]Grant
+ }
+@@ -199,7 +202,7 @@ func (h *Handler) Mount(m router.Mux) {
+ 	h.register(h.SupportedGrantTypes,
+ 		&clientCredentials{issuer: h.Issuer, logger: h.Logger},
+ 		&password{issuer: h.Issuer, logger: h.Logger, connectorID: h.PasswordConnector},
+-		&tokenExchange{issuer: h.Issuer, logger: h.Logger, registry: h.RegistryTokens},
++		&tokenExchange{issuer: h.Issuer, logger: h.Logger, registry: h.RegistryTokens, artifact: h.ArtifactTokens},
+ 		&authorizationCode{issuer: h.Issuer, storage: h.Storage, connectors: h.Connectors, now: h.Now, logger: h.Logger,
+ 			delegation: h.Delegation, signer: h.Signer, issuerURL: h.IssuerURL},
+ 		&refresh{storage: h.Storage, issuer: h.Issuer, policy: h.RefreshPolicy, sessions: h.Sessions, sessionsEnabled: h.SessionsEnabled, now: h.Now, logger: h.Logger},
+diff --git a/server/grants/tokenexchange.go b/server/grants/tokenexchange.go
+index e251767..835c8a5 100644
+--- a/server/grants/tokenexchange.go
++++ b/server/grants/tokenexchange.go
+@@ -25,6 +25,8 @@ type tokenExchange struct {
+ 	logger *slog.Logger
+ 	// registry issues PathOps registry tokens (nil: disabled).
+ 	registry *registry.Issuer
++	// artifact issues PathOps Artifact Store tokens (nil: disabled).
++	artifact *registry.Issuer
+ }
+ 
+ func (g *tokenExchange) GrantType() string {
+@@ -79,8 +81,11 @@ func (g *tokenExchange) Authorize(ctx context.Context, req *Request, client stor
+ 		"email", email, "groups", identity.Groups,
+ 		"subject_token_type", req.SubjectTokenType, "requested_token_type", reqType)
+ 
+-	if reqType == registry.TokenType {
++	switch reqType {
++	case registry.TokenType:
+ 		return g.registryToken(ctx, req, client, identity.UserID)
++	case registry.ArtifactTokenType:
++		return g.artifactToken(ctx, req, client, identity.UserID)
+ 	}
+ 
+ 	auth := tokens.Authorization{
+@@ -122,27 +127,38 @@ func (g *tokenExchange) Authorize(ctx context.Context, req *Request, client stor
+ // Application build ServiceAccount (registry.Issuer). A refusal says nothing
+ // about why; the log does.
+ func (g *tokenExchange) registryToken(ctx context.Context, req *Request, client storage.Client, subject string) (Responder, error) {
+-	if g.registry == nil {
++	return g.workloadToken(ctx, req, client, subject, g.registry, registry.TokenType, "registry")
++}
++
++// artifactToken answers a PathOps Artifact Store token request the same way,
++// only for an Application artifact ServiceAccount.
++func (g *tokenExchange) artifactToken(ctx context.Context, req *Request, client storage.Client, subject string) (Responder, error) {
++	return g.workloadToken(ctx, req, client, subject, g.artifact, registry.ArtifactTokenType, "artifact")
++}
++
++func (g *tokenExchange) workloadToken(ctx context.Context, req *Request, client storage.Client, subject string,
++	iss *registry.Issuer, tokenType, kind string) (Responder, error) {
++	if iss == nil {
+ 		return nil, &oauth2.Error{Type: oauth2.RequestNotSupported, Description: "Invalid requested_token_type.", Status: http.StatusBadRequest}
+ 	}
+-	if !g.registry.Client(client.ID, req.ConnectorID) || req.SubjectTokenType != oauth2.TokenTypeID {
+-		g.logger.WarnContext(ctx, "registry token refused: client, connector or subject token type",
++	if !iss.Client(client.ID, req.ConnectorID) || req.SubjectTokenType != oauth2.TokenTypeID {
++		g.logger.WarnContext(ctx, kind+" token refused: client, connector or subject token type",
+ 			"client_id", client.ID, "connector_id", req.ConnectorID, "subject_token_type", req.SubjectTokenType)
+ 		return nil, &oauth2.Error{Type: oauth2.AccessDenied, Status: http.StatusForbidden}
+ 	}
+-	token, expiry, err := g.registry.Issue(ctx, subject)
++	token, expiry, err := iss.Issue(ctx, subject)
+ 	if errors.Is(err, registry.ErrDenied) {
+-		g.logger.WarnContext(ctx, "registry token refused", "user_id", subject, "err", err)
++		g.logger.WarnContext(ctx, kind+" token refused", "user_id", subject, "err", err)
+ 		return nil, &oauth2.Error{Type: oauth2.AccessDenied, Status: http.StatusForbidden}
+ 	}
+ 	if err != nil {
+-		g.logger.ErrorContext(ctx, "registry token failed", "user_id", subject, "err", err)
++		g.logger.ErrorContext(ctx, kind+" token failed", "user_id", subject, "err", err)
+ 		return nil, &oauth2.Error{Type: oauth2.ServerError, Status: http.StatusInternalServerError}
+ 	}
+-	g.logger.InfoContext(ctx, "registry token issued", "client_id", client.ID, "user_id", subject, "expiry", expiry)
++	g.logger.InfoContext(ctx, kind+" token issued", "client_id", client.ID, "user_id", subject, "expiry", expiry)
+ 	return tokens.Response{
+ 		AccessToken:     token,
+-		IssuedTokenType: registry.TokenType,
++		IssuedTokenType: tokenType,
+ 		TokenType:       "bearer",
+ 		ExpiresIn:       int(time.Until(expiry).Seconds()),
+ 	}, nil
+diff --git a/server/grants/tokenexchange_registry_test.go b/server/grants/tokenexchange_registry_test.go
+index fc7d690..23ddaeb 100644
+--- a/server/grants/tokenexchange_registry_test.go
++++ b/server/grants/tokenexchange_registry_test.go
+@@ -63,3 +63,49 @@ func TestRegistryToken(t *testing.T) {
+ 	require.ErrorAs(t, err, &oe)
+ 	require.Equal(t, oauth2.RequestNotSupported, oe.Type)
+ }
++
++func TestArtifactToken(t *testing.T) {
++	_, key, _ := ed25519.GenerateKey(rand.Reader)
++	const app = "11111111-1111-4111-8111-111111111111"
++	labels := map[string]map[string]string{
++		"app-a-ci":                {registry.LabelApplication: app, registry.LabelCI: "true"},
++		"app-a-ci/app-a-artifact": {registry.LabelApplication: app, registry.LabelCapability: registry.CapabilityArtifact},
++		"app-a-ci/app-a-build":    {registry.LabelApplication: app, registry.LabelCapability: registry.CapabilityBuild},
++	}
++	lookup := func(_ context.Context, ns, sa string) (map[string]string, error) {
++		k := ns
++		if sa != "" {
++			k += "/" + sa
++		}
++		return labels[k], nil
++	}
++	art, err := registry.NewArtifact(registry.ArtifactConfig{Clients: []string{"pathops-artifact-store"}, Connector: "k8s-cell",
++		Issuer: "https://dex.example.org/artifacts", Audience: "pathops-artifact-store", KeyID: "artifact-1"}, key, lookup)
++	require.NoError(t, err)
++	g := &tokenExchange{logger: slog.New(slog.NewTextHandler(io.Discard, nil)), artifact: art}
++	req := &Request{ConnectorID: "k8s-cell", SubjectTokenType: oauth2.TokenTypeID}
++	store := storage.Client{ID: "pathops-artifact-store"}
++
++	out, err := g.artifactToken(t.Context(), req, store, "system:serviceaccount:app-a-ci:app-a-artifact")
++	require.NoError(t, err)
++	res := out.(tokens.Response)
++	require.Equal(t, registry.ArtifactTokenType, res.IssuedTokenType)
++	require.LessOrEqual(t, res.ExpiresIn, 300)
++
++	denied := func(client storage.Client, subject string) {
++		t.Helper()
++		_, err := g.artifactToken(t.Context(), req, client, subject)
++		var oe *oauth2.Error
++		require.ErrorAs(t, err, &oe)
++		require.Equal(t, oauth2.AccessDenied, oe.Type)
++	}
++	denied(storage.Client{ID: "zot"}, "system:serviceaccount:app-a-ci:app-a-artifact")
++	denied(store, "system:serviceaccount:app-a-ci:app-a-build")
++
++	// Registry tokens disabled here: the registry token type is not supported,
++	// and an artifact identity cannot reach it.
++	_, err = g.registryToken(t.Context(), req, storage.Client{ID: "zot"}, "system:serviceaccount:app-a-ci:app-a-artifact")
++	var oe *oauth2.Error
++	require.ErrorAs(t, err, &oe)
++	require.Equal(t, oauth2.RequestNotSupported, oe.Type)
++}
+diff --git a/server/registry/artifact_test.go b/server/registry/artifact_test.go
+new file mode 100644
+index 0000000..236cdb5
+--- /dev/null
++++ b/server/registry/artifact_test.go
+@@ -0,0 +1,120 @@
++package registry
++
++import (
++	"crypto/ed25519"
++	"crypto/rand"
++	"encoding/base64"
++	"encoding/json"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++var testArtifactConfig = ArtifactConfig{Clients: []string{"pathops-artifact-store"}, Connector: "k8s-cell",
++	Issuer: "https://dex.example.org/artifacts", Audience: "pathops-artifact-store", KeyID: "artifact-1"}
++
++func artifactCluster() cluster {
++	c := goodCluster()
++	c["app-a-ci/app-a-artifact"] = map[string]string{LabelApplication: appA, LabelCapability: CapabilityArtifact}
++	return c
++}
++
++func newArtifactIssuer(t *testing.T, c cluster) (*Issuer, ed25519.PublicKey) {
++	t.Helper()
++	pub, key, err := ed25519.GenerateKey(rand.Reader)
++	require.NoError(t, err)
++	i, err := NewArtifact(testArtifactConfig, key, c.lookup)
++	require.NoError(t, err)
++	return i, pub
++}
++
++func TestArtifactIssue(t *testing.T) {
++	i, pub := newArtifactIssuer(t, artifactCluster())
++	require.Equal(t, ArtifactTokenType, i.TokenType())
++	now := time.Unix(1_800_000_000, 0)
++	i.Now = func() time.Time { return now }
++	tok, exp, err := i.Issue(t.Context(), "system:serviceaccount:app-a-ci:app-a-artifact")
++	require.NoError(t, err)
++	require.Equal(t, now.Add(5*time.Minute).UTC(), exp)
++	parts := strings.Split(tok, ".")
++	require.Len(t, parts, 3)
++	sig, _ := base64.RawURLEncoding.DecodeString(parts[2])
++	require.True(t, ed25519.Verify(pub, []byte(parts[0]+"."+parts[1]), sig))
++	var header, claims map[string]any
++	raw, _ := base64.RawURLEncoding.DecodeString(parts[0])
++	require.NoError(t, json.Unmarshal(raw, &header))
++	raw, _ = base64.RawURLEncoding.DecodeString(parts[1])
++	require.NoError(t, json.Unmarshal(raw, &claims))
++	require.Equal(t, map[string]any{"alg": "EdDSA", "typ": "JWT", "kid": "artifact-1"}, header)
++	require.Equal(t, "https://dex.example.org/artifacts", claims["iss"])
++	require.Equal(t, "pathops-artifact-store", claims["aud"])
++	require.Equal(t, "system:serviceaccount:app-a-ci:app-a-artifact", claims["sub"])
++	require.Equal(t, appA, claims["pathops_application"])
++	require.Equal(t, []any{"read", "write"}, claims["pathops_operations"])
++	require.NotContains(t, claims, "access", "an Artifact Store token is no registry token")
++	require.EqualValues(t, now.Unix()+300, claims["exp"])
++}
++
++// The two kinds of workload identity never stand in for each other.
++func TestArtifactAndRegistryIdentitiesAreDistinct(t *testing.T) {
++	art, _ := newArtifactIssuer(t, artifactCluster())
++	_, _, err := art.Issue(t.Context(), "system:serviceaccount:app-a-ci:app-a-build")
++	require.ErrorIs(t, err, ErrDenied, "the build ServiceAccount gets no Artifact Store token")
++
++	reg, _ := newTestIssuer(t, artifactCluster())
++	_, _, err = reg.Issue(t.Context(), "system:serviceaccount:app-a-ci:app-a-artifact")
++	require.ErrorIs(t, err, ErrDenied, "the artifact ServiceAccount gets no registry token")
++
++	// An artifact-named ServiceAccount labeled with the build capability (or
++	// the reverse) is refused too.
++	c := artifactCluster()
++	c["app-a-ci/app-a-artifact"][LabelCapability] = CapabilityBuild
++	art, _ = newArtifactIssuer(t, c)
++	_, _, err = art.Issue(t.Context(), "system:serviceaccount:app-a-ci:app-a-artifact")
++	require.ErrorIs(t, err, ErrDenied)
++}
++
++func TestArtifactIssueDenied(t *testing.T) {
++	for name, tc := range map[string]struct {
++		subject string
++		change  func(cluster)
++	}{
++		"another Application's name": {subject: "system:serviceaccount:app-a-ci:app-b-artifact"},
++		"not a CI namespace":         {subject: "system:serviceaccount:app-a:app-a-artifact"},
++		"default ServiceAccount":     {subject: "system:serviceaccount:app-a-ci:default"},
++		"ServiceAccount of another app": {subject: "system:serviceaccount:app-a-ci:app-a-artifact", change: func(c cluster) {
++			c["app-a-ci/app-a-artifact"][LabelApplication] = "22222222-2222-4222-8222-222222222222"
++		}},
++		"ServiceAccount no capability": {subject: "system:serviceaccount:app-a-ci:app-a-artifact", change: func(c cluster) { delete(c["app-a-ci/app-a-artifact"], LabelCapability) }},
++		"namespace not labeled CI":     {subject: "system:serviceaccount:app-a-ci:app-a-artifact", change: func(c cluster) { c["app-a-ci"][LabelCI] = "false" }},
++		"ServiceAccount missing":       {subject: "system:serviceaccount:app-a-ci:app-a-artifact", change: func(c cluster) { delete(c, "app-a-ci/app-a-artifact") }},
++	} {
++		t.Run(name, func(t *testing.T) {
++			c := artifactCluster()
++			if tc.change != nil {
++				tc.change(c)
++			}
++			i, _ := newArtifactIssuer(t, c)
++			_, _, err := i.Issue(t.Context(), tc.subject)
++			require.ErrorIs(t, err, ErrDenied)
++		})
++	}
++}
++
++func TestNewArtifactValidates(t *testing.T) {
++	_, key, _ := ed25519.GenerateKey(rand.Reader)
++	for name, change := range map[string]func(*ArtifactConfig){
++		"no clients":       func(c *ArtifactConfig) { c.Clients = nil },
++		"no audience":      func(c *ArtifactConfig) { c.Audience = "" },
++		"http issuer":      func(c *ArtifactConfig) { c.Issuer = "http://dex.example.org/artifacts" },
++		"lifetime over 5m": func(c *ArtifactConfig) { c.ValidFor = "10m" },
++	} {
++		c := testArtifactConfig
++		change(&c)
++		_, err := NewArtifact(c, key, goodCluster().lookup)
++		require.Error(t, err, name)
++		require.Contains(t, err.Error(), "artifactTokens.", name)
++	}
++}
+diff --git a/server/registry/registry.go b/server/registry/registry.go
+index be33d54..53f1aeb 100644
+--- a/server/registry/registry.go
++++ b/server/registry/registry.go
+@@ -1,5 +1,9 @@
+-// Package registry is the PathOps extension that issues registry tokens to
+-// Application build workloads (PathOps Decision 0056).
++// Package registry is the PathOps extension that issues short-lived tokens of
++// Cell tools to Application workloads by token exchange: registry tokens to
++// build workloads (PathOps Decision 0056) and Artifact Store tokens to
++// Application artifact identities (Decision 0061). Both share the workload
++// identity checks and the signing; each has its own section, token type,
++// ServiceAccount, capability, key, issuer and audience.
+ //
+ // An Application's build ServiceAccount (<app>-build in <app>-ci) exchanges
+ // its projected Kubernetes token at Dex (RFC 8693, through the Kubernetes
+@@ -23,6 +27,15 @@
+ // ServiceAccount pathops.io/capability=build-and-push. Those labels are
+ // written only by PathOps provisioning (protected by Cell admission). Any
+ // other ServiceAccount gets no registry authority.
++//
++// An Application's artifact ServiceAccount (<app>-artifact in <app>-ci,
++// capability artifact-store) gets an Artifact Store token the same way:
++//
++//	requested_token_type = urn:pathops:params:oauth:token-type:artifact
++//
++//	{"iss", "sub", "aud", "iat", "nbf", "exp" (at most 5 minutes), "jti",
++//	 "pathops_application": <application id>,
++//	 "pathops_operations": ["read", "write"]}
+ package registry
+ 
+ import (
+@@ -50,14 +63,23 @@ import (
+ // TokenType is the RFC 8693 requested_token_type of a registry token.
+ const TokenType = "urn:pathops:params:oauth:token-type:registry"
+ 
++// ArtifactTokenType is the requested_token_type of an Artifact Store token.
++const ArtifactTokenType = "urn:pathops:params:oauth:token-type:artifact"
++
+ // Labels the workload's Namespace and ServiceAccount must carry.
+ const (
+ 	LabelApplication = "pathops.io/application-id"
+ 	LabelCI          = "pathops.io/ci"
+ 	LabelCapability  = "pathops.io/capability"
+ 	CapabilityBuild  = "build-and-push"
++	// CapabilityArtifact is the capability of an Application's artifact
++	// ServiceAccount.
++	CapabilityArtifact = "artifact-store"
+ )
+ 
++// ArtifactOperations are the operations of every Artifact Store token.
++var ArtifactOperations = []string{"read", "write"}
++
+ // Config is the "registryTokens" section of the Dex configuration.
+ type Config struct {
+ 	// Clients are the OAuth clients that may request registry tokens.
+@@ -77,8 +99,40 @@ type Config struct {
+ 	RepositoryPrefix string `json:"repositoryPrefix"`
+ }
+ 
+-// Issuer issues registry tokens.
++// ArtifactConfig is the "artifactTokens" section of the Dex configuration: as
++// Config, without a repository prefix.
++type ArtifactConfig struct {
++	Clients        []string `json:"clients"`
++	Connector      string   `json:"connector"`
++	Issuer         string   `json:"issuer"`
++	Audience       string   `json:"audience"`
++	SigningKeyFile string   `json:"signingKeyFile"`
++	KeyID          string   `json:"keyID"`
++	ValidFor       string   `json:"validFor"`
++}
++
++// profile is what distinguishes one kind of workload token from another.
++type profile struct {
++	section    string // configuration section, in errors
++	tokenType  string
++	saSuffix   string // the ServiceAccount is <app><saSuffix> in <app>-ci
++	capability string // its pathops.io/capability
++	claims     func(i *Issuer, app string) map[string]any
++}
++
++var registryProfile = profile{section: "registryTokens", tokenType: TokenType, saSuffix: "-build", capability: CapabilityBuild,
++	claims: func(i *Issuer, app string) map[string]any {
++		return map[string]any{"access": []map[string]any{{"type": "repository", "name": i.prefix + app, "actions": []string{"pull", "push"}}}}
++	}}
++
++var artifactProfile = profile{section: "artifactTokens", tokenType: ArtifactTokenType, saSuffix: "-artifact", capability: CapabilityArtifact,
++	claims: func(*Issuer, string) map[string]any {
++		return map[string]any{"pathops_operations": ArtifactOperations}
++	}}
++
++// Issuer issues one kind of workload token (registry or Artifact Store).
+ type Issuer struct {
++	p         profile
+ 	clients   []string
+ 	connector string
+ 	issuer    string
+@@ -110,72 +164,100 @@ var (
+ // NewIssuer validates c, loads its key and reads labels from the in-cluster
+ // Kubernetes API as Dex's own ServiceAccount.
+ func NewIssuer(c Config) (*Issuer, error) {
++	return newInCluster(registryProfile, c)
++}
++
++// NewArtifactIssuer is NewIssuer for Artifact Store tokens.
++func NewArtifactIssuer(c ArtifactConfig) (*Issuer, error) {
++	return newInCluster(artifactProfile, c.config())
++}
++
++func (c ArtifactConfig) config() Config {
++	return Config{Clients: c.Clients, Connector: c.Connector, Issuer: c.Issuer, Audience: c.Audience,
++		SigningKeyFile: c.SigningKeyFile, KeyID: c.KeyID, ValidFor: c.ValidFor}
++}
++
++func newInCluster(p profile, c Config) (*Issuer, error) {
+ 	raw, err := os.ReadFile(c.SigningKeyFile)
+ 	if err != nil {
+-		return nil, fmt.Errorf("registryTokens.signingKeyFile: %v", err)
++		return nil, fmt.Errorf("%s.signingKeyFile: %v", p.section, err)
+ 	}
+ 	block, _ := pem.Decode(raw)
+ 	if block == nil || block.Type != "PRIVATE KEY" {
+-		return nil, errors.New("registryTokens.signingKeyFile is not a PEM PRIVATE KEY")
++		return nil, fmt.Errorf("%s.signingKeyFile is not a PEM PRIVATE KEY", p.section)
+ 	}
+ 	k, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+ 	key, ok := k.(ed25519.PrivateKey)
+ 	if err != nil || !ok {
+-		return nil, errors.New("registryTokens.signingKeyFile is not an Ed25519 key")
++		return nil, fmt.Errorf("%s.signingKeyFile is not an Ed25519 key", p.section)
+ 	}
+-	i, err := New(c, key, nil)
++	i, err := newIssuer(p, c, key, nil)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	kc, err := inCluster()
+ 	if err != nil {
+-		return nil, fmt.Errorf("registryTokens: the Kubernetes API: %v", err)
++		return nil, fmt.Errorf("%s: the Kubernetes API: %v", p.section, err)
+ 	}
+ 	i.Lookup = kc.labels
+ 	return i, nil
+ }
+ 
+-// New validates c (its SigningKeyFile is not read) and returns an Issuer
+-// signing with key and reading labels with lookup.
++// New validates c (its SigningKeyFile is not read) and returns an Issuer of
++// registry tokens signing with key and reading labels with lookup.
+ func New(c Config, key ed25519.PrivateKey, lookup func(ctx context.Context, namespace, sa string) (map[string]string, error)) (*Issuer, error) {
+-	i := &Issuer{clients: c.Clients, connector: c.Connector, issuer: c.Issuer, audience: c.Audience, keyID: c.KeyID,
++	return newIssuer(registryProfile, c, key, lookup)
++}
++
++// NewArtifact is New for Artifact Store tokens.
++func NewArtifact(c ArtifactConfig, key ed25519.PrivateKey, lookup func(ctx context.Context, namespace, sa string) (map[string]string, error)) (*Issuer, error) {
++	return newIssuer(artifactProfile, c.config(), key, lookup)
++}
++
++func newIssuer(p profile, c Config, key ed25519.PrivateKey, lookup func(ctx context.Context, namespace, sa string) (map[string]string, error)) (*Issuer, error) {
++	i := &Issuer{p: p, clients: c.Clients, connector: c.Connector, issuer: c.Issuer, audience: c.Audience, keyID: c.KeyID,
+ 		key: key, ttl: 5 * time.Minute, prefix: c.RepositoryPrefix, Lookup: lookup, Now: time.Now}
+ 	if len(c.Clients) == 0 || slices.ContainsFunc(c.Clients, func(s string) bool { return !identifier.MatchString(s) }) {
+-		return nil, errors.New("registryTokens.clients must name client ids")
++		return nil, fmt.Errorf("%s.clients must name client ids", p.section)
+ 	}
+ 	if !identifier.MatchString(c.Connector) || !identifier.MatchString(c.KeyID) || c.Audience == "" {
+-		return nil, errors.New("registryTokens.connector, keyID and audience are required")
++		return nil, fmt.Errorf("%s.connector, keyID and audience are required", p.section)
+ 	}
+ 	if u, err := url.Parse(c.Issuer); err != nil || u.Scheme != "https" || u.Host == "" {
+-		return nil, errors.New("registryTokens.issuer must be an https URL")
++		return nil, fmt.Errorf("%s.issuer must be an https URL", p.section)
+ 	}
+ 	if c.ValidFor != "" {
+ 		d, err := time.ParseDuration(c.ValidFor)
+ 		if err != nil || d <= 0 || d > 5*time.Minute {
+-			return nil, errors.New("registryTokens.validFor must be positive and at most 5m")
++			return nil, fmt.Errorf("%s.validFor must be positive and at most 5m", p.section)
+ 		}
+ 		i.ttl = d
+ 	}
+-	if i.prefix == "" {
+-		i.prefix = "apps/"
+-	}
+-	if !prefix.MatchString(i.prefix) {
+-		return nil, fmt.Errorf("registryTokens.repositoryPrefix %q is not a repository path prefix ending in /", i.prefix)
++	if p.tokenType == TokenType {
++		if i.prefix == "" {
++			i.prefix = "apps/"
++		}
++		if !prefix.MatchString(i.prefix) {
++			return nil, fmt.Errorf("%s.repositoryPrefix %q is not a repository path prefix ending in /", p.section, i.prefix)
++		}
+ 	}
+ 	if len(key) != ed25519.PrivateKeySize {
+-		return nil, errors.New("registryTokens: an Ed25519 signing key is required")
++		return nil, fmt.Errorf("%s: an Ed25519 signing key is required", p.section)
+ 	}
+ 	return i, nil
+ }
+ 
+-// Client reports whether clientID may request registry tokens through
++// TokenType is the requested_token_type this Issuer answers.
++func (i *Issuer) TokenType() string { return i.p.tokenType }
++
++// Client reports whether clientID may request this Issuer's tokens through
+ // connectorID.
+ func (i *Issuer) Client(clientID, connectorID string) bool {
+ 	return connectorID == i.connector && slices.Contains(i.clients, clientID)
+ }
+ 
+-// Issue returns a registry token for the workload subject (the connector's
+-// verified "sub": system:serviceaccount:<namespace>:<name>).
++// Issue returns a token for the workload subject (the connector's verified
++// "sub": system:serviceaccount:<namespace>:<name>).
+ func (i *Issuer) Issue(ctx context.Context, subject string) (string, time.Time, error) {
+ 	app, err := i.application(ctx, subject)
+ 	if err != nil {
+@@ -188,12 +270,15 @@ func (i *Issuer) Issue(ctx context.Context, subject string) (string, time.Time,
+ 		return "", time.Time{}, err
+ 	}
+ 	header, _ := json.Marshal(map[string]string{"alg": "EdDSA", "typ": "JWT", "kid": i.keyID})
+-	claims, err := json.Marshal(map[string]any{
++	c := map[string]any{
+ 		"iss": i.issuer, "sub": subject, "aud": i.audience,
+ 		"iat": now.Unix(), "nbf": now.Unix(), "exp": exp.Unix(), "jti": hex.EncodeToString(jti),
+ 		"pathops_application": app,
+-		"access":              []map[string]any{{"type": "repository", "name": i.prefix + app, "actions": []string{"pull", "push"}}},
+-	})
++	}
++	for k, v := range i.p.claims(i, app) {
++		c[k] = v
++	}
++	claims, err := json.Marshal(c)
+ 	if err != nil {
+ 		return "", time.Time{}, err
+ 	}
+@@ -201,7 +286,7 @@ func (i *Issuer) Issue(ctx context.Context, subject string) (string, time.Time,
+ 	return in + "." + base64.RawURLEncoding.EncodeToString(ed25519.Sign(i.key, []byte(in))), exp, nil
+ }
+ 
+-// application is the Application id of a build workload, or ErrDenied.
++// application is the Application id of the profile's workload, or ErrDenied.
+ func (i *Issuer) application(ctx context.Context, subject string) (string, error) {
+ 	parts := strings.Split(subject, ":")
+ 	if len(parts) != 4 || parts[0] != "system" || parts[1] != "serviceaccount" {
+@@ -209,8 +294,8 @@ func (i *Issuer) application(ctx context.Context, subject string) (string, error
+ 	}
+ 	ns, sa := parts[2], parts[3]
+ 	app, ok := strings.CutSuffix(ns, "-ci")
+-	if !ok || !dnsLabel.MatchString(ns) || app == "" || sa != app+"-build" {
+-		return "", fmt.Errorf("%w: %s is not an Application build ServiceAccount (<app>-build in <app>-ci)", ErrDenied, subject)
++	if !ok || !dnsLabel.MatchString(ns) || app == "" || sa != app+i.p.saSuffix {
++		return "", fmt.Errorf("%w: %s is not an Application's <app>%s ServiceAccount in <app>-ci", ErrDenied, subject, i.p.saSuffix)
+ 	}
+ 	nsLabels, err := i.Lookup(ctx, ns, "")
+ 	if err != nil {
+@@ -228,8 +313,8 @@ func (i *Issuer) application(ctx context.Context, subject string) (string, error
+ 		return "", fmt.Errorf("%w: Namespace %s is not a CI namespace", ErrDenied, ns)
+ 	case saLabels[LabelApplication] != id:
+ 		return "", fmt.Errorf("%w: ServiceAccount %s/%s is not of Application %s", ErrDenied, ns, sa, id)
+-	case saLabels[LabelCapability] != CapabilityBuild:
+-		return "", fmt.Errorf("%w: ServiceAccount %s/%s has no %s capability", ErrDenied, ns, sa, CapabilityBuild)
++	case saLabels[LabelCapability] != i.p.capability:
++		return "", fmt.Errorf("%w: ServiceAccount %s/%s has no %s capability", ErrDenied, ns, sa, i.p.capability)
+ 	}
+ 	return id, nil
+ }
+diff --git a/server/server.go b/server/server.go
+index 7eeacc0..4fea62f 100644
+--- a/server/server.go
++++ b/server/server.go
+@@ -258,6 +258,7 @@ func (s *Server) mount(routes router.Mux, c Config, rc resolvedConfig) {
+ 			Signer:              c.Signer,
+ 			IssuerURL:           s.issuerURL.String(),
+ 			RegistryTokens:      c.RegistryTokens,
++			ArtifactTokens:      c.ArtifactTokens,
+ 		},
+ 		&userinfo.Handler{
+ 			Issuer: s.issuerURL.String(),
+-- 
+2.53.0
+
