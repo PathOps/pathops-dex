@@ -25,12 +25,10 @@ Current patch set:
 - `0005`: the consent screen describes the BUILD_AND_PUSH details (PathOps
   Decision 0056): Forgejo repository read tokens and read-only deploy keys,
   and the Kubernetes objects of an Application's CI namespace.
-- `0006`: opt-in `registryTokens`: short-lived registry tokens for Application
-  build workloads, by token exchange. See [Registry tokens](#registry-tokens).
-- `0007`: opt-in `artifactTokens`: short-lived Artifact Store tokens for
-  Application artifact identities (PathOps Decision 0061), by the same token
-  exchange and the same workload checks as `0006`. See
-  [Artifact Store tokens](#artifact-store-tokens).
+- `0006`: opt-in `workloadTokenExchange` (PathOps Decision 0065): a generic
+  RFC 8693 exchange of a workload subject token and a bound, signed actor
+  token for a short-lived token of a configured service audience. See
+  [Workload token exchange](#workload-token-exchange).
 
 Long-term goal: remove the functional patch once equivalent functionality is
 available upstream, and consume official Dex images again.
@@ -175,80 +173,65 @@ userinfo and introspection refuse it, its audience is no tool's, and it is
 never a derivation subject (that is the grant handle, for the delegate only).
 Delegation requires a signer that can type tokens (the local signer).
 
-### Registry tokens
+### Workload token exchange
 
-Patch `0006` lets an Application's build ServiceAccount (`<app>-build` in
-`<app>-ci`) exchange its projected Kubernetes token for a registry token of
-its own Application's repository only:
+Patch `0006` (PathOps Decision 0065) adds one generic RFC 8693 workload token
+exchange. A trusted confidential client (the PathOps Tenant Control Plane)
+presents a workload's token as `subject_token` and its own short-lived,
+signed decision as `actor_token`, and gets a short-lived token for a
+configured service audience (the registry, the Artifact Store):
 
 ```yaml
-registryTokens:
-  clients: [zot]                      # clients that may ask
-  connector: k8s-cell                 # the Kubernetes workload connector
-  issuer: https://dex.example.org/registry
-  audience: zot-registry
-  signingKeyFile: /etc/dex/registry/registry.key   # Ed25519, PEM PKCS#8
-  keyID: registry-1
-  validFor: 5m                        # default and maximum
-  repositoryPrefix: apps/             # default
+workloadTokenExchange:
+  clients: [pathops-tenant-control-plane]   # confidential clients that may ask
+  subjectConnector: k8s-cell                # verifies subject tokens
+  actors:
+    - issuer: pathops-tenant-control-plane
+      audience: pathops-workload-exchange
+      keys: [{kid: tcp-workload-1, ed25519: <base64url raw public key>}]
+  outputs:
+    - audience: pathops-registry
+      issuer: https://dex.example.org/registry
+      signingKeyFile: /etc/dex/registry/registry.key   # Ed25519, PEM PKCS#8
+      keyID: registry-1
+      maxLifetime: 30m                                 # at most 1h
+      claims: [access, pathops_application]
+    - audience: pathops-artifact-store
+      issuer: https://dex.example.org/artifacts
+      signingKeyFile: /etc/dex/artifact/artifact.key
+      keyID: artifact-1
+      maxLifetime: 5m
+      claims: [pathops_application, pathops_operations]
 ```
 
 ```bash
-curl -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange -d client_id=zot \
-  -d connector_id=k8s-cell -d subject_token_type=urn:ietf:params:oauth:token-type:id_token \
-  -d requested_token_type=urn:pathops:params:oauth:token-type:registry \
-  --data-urlencode subject_token@/var/run/secrets/pathops/token https://dex.example.org/token
+curl -u pathops-tenant-control-plane:<secret> \
+  -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+  -d subject_token_type=urn:ietf:params:oauth:token-type:id_token --data-urlencode subject_token=<workload JWT> \
+  -d actor_token_type=urn:ietf:params:oauth:token-type:jwt --data-urlencode actor_token=<actor JWT> \
+  -d audience=pathops-registry https://dex.example.org/token
 ```
 
-- The token is a JWT signed with the dedicated Ed25519 key (`alg` `EdDSA`,
-  `kid` = `keyID`), never with Dex's OIDC keys, so a registry that also
-  validates Dex OIDC tokens cannot take it for one.
-- Claims: `iss`/`aud` as configured, `sub` the ServiceAccount, `iat`, `nbf`,
-  `exp`, `jti`, `pathops_application`, and the Docker Distribution `access`
-  claim `[{"type":"repository","name":"<prefix><application id>","actions":["pull","push"]}]`.
-- The Application id is read from the Kubernetes API with Dex's own
-  ServiceAccount (it needs `get` on `namespaces` and `serviceaccounts`): the
-  Namespace and the ServiceAccount must carry the same
-  `pathops.io/application-id`, the Namespace `pathops.io/ci=true` and the
-  ServiceAccount `pathops.io/capability=build-and-push`. Those labels must be
-  writable only by PathOps provisioning (Cell admission).
-- Any other client, connector, subject token type or identity gets
-  `access_denied`; the reason is only logged.
-
-### Artifact Store tokens
-
-Patch `0007` generalizes `0006` into token profiles: the same workload
-identity checks, Kubernetes label lookup and signing issue a second kind of
-token, for the PathOps Artifact Store. An Application's artifact
-ServiceAccount (`<app>-artifact` in `<app>-ci`) exchanges its Kubernetes token
-for an Artifact Store token of its own Application only:
-
-```yaml
-artifactTokens:
-  clients: [pathops-artifact-store]  # clients that may ask
-  connector: k8s-cell
-  issuer: https://dex.example.org/artifacts
-  audience: pathops-artifact-store
-  signingKeyFile: /etc/dex/artifact/artifact.key   # Ed25519, PEM PKCS#8
-  keyID: artifact-1
-  validFor: 5m                       # default and maximum
-```
-
-The request is the registry one with
-`requested_token_type=urn:pathops:params:oauth:token-type:artifact`.
-
-- The token is a JWT signed with its own Ed25519 key (`alg` `EdDSA`, `kid` =
-  `keyID`), never with Dex's OIDC keys or the registry key.
-- Claims: `iss`/`aud` as configured, `sub` the ServiceAccount, `iat`, `nbf`,
-  `exp`, `jti`, `pathops_application` and `pathops_operations`
-  (`["read", "write"]`). There is no `access` claim: it is not a registry
-  token.
-- The Application id comes from the Kubernetes API as for registry tokens:
-  Namespace and ServiceAccount with the same `pathops.io/application-id`, the
-  Namespace `pathops.io/ci=true`, and the ServiceAccount
-  `pathops.io/capability=artifact-store`.
-- A build ServiceAccount gets no Artifact Store token, and an artifact
-  ServiceAccount gets no registry token.
+- The subject token is verified by `subjectConnector` (issuer, signature,
+  expiry, and with patch `0001` its audience).
+- The actor token is an EdDSA JWT of a configured actor: `iss`, `aud`, `kid`
+  and signature as configured, `iat` and `exp` (at most 5 minutes apart, not
+  expired), `subject_token_hash` = base64url(SHA-256(the raw subject token)),
+  `target_audience` = the requested `audience`, and an `authorization`
+  object. An optional `token_lifetime` (seconds) shortens the issued token.
+- The issued token is a JWT signed with the output's own Ed25519 key (`alg`
+  `EdDSA`, `kid` = `keyID`), never with Dex's OIDC keys: `iss`/`aud` of the
+  output, `sub` the subject's identity, `iat`, `nbf`, `exp` (at most
+  `maxLifetime`), `jti`, and each claim listed in `claims` copied unchanged
+  from the actor's `authorization` object. Nothing else of the actor is
+  copied, and `iss`, `sub`, `aud`, `exp`, `nbf`, `iat`, `jti` cannot be.
+- Dex does not interpret `authorization`, reads no Kubernetes object and
+  knows no naming convention: the actor decides what a workload may do; Dex
+  proves who decided it, that it belongs to exactly this subject token, that
+  it is fresh, and bounds the audience and lifetime of what it issues.
+- A token exchange carrying an `actor_token` is answered only by this grant
+  (`unsupported_grant_type` when it is not configured). Any other client,
+  subject or actor gets `access_denied`; the reason is only logged.
 
 ### Login sessions
 

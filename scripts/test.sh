@@ -45,12 +45,18 @@ for t in TestDelegationFlow TestDelegationOperationsAreSeparate TestDelegationPu
   grep -q -- "--- PASS: $t " <<< "$out" || { echo "test: $t did not run and pass" >&2; exit 1; }
 done
 
-echo "test: PathOps BUILD_AND_PUSH consent screen and registry token tests"
-out=$(go test ./server/ ./server/registry/ ./server/grants/ ./server/templates/ -count=1 \
-  -run 'Registry|TestIssue|TestClient|TestNewValidates|TestDelegationTemplate' -v)
+echo "test: PathOps BUILD_AND_PUSH consent screen tests"
+out=$(go test ./server/templates/ -count=1 -run 'TestDelegationTemplate' -v)
 echo "$out" | grep -E -- '^--- (PASS|FAIL)'
-for t in TestIssue TestIssueDenied TestClient TestNewValidates TestRegistryToken TestHandleTokenExchangeRegistry \
-  TestDelegationTemplateBuildAndPush; do
+grep -q -- "--- PASS: TestDelegationTemplateBuildAndPush " <<< "$out" \
+  || { echo "test: TestDelegationTemplateBuildAndPush did not run and pass" >&2; exit 1; }
+
+echo "test: PathOps generic workload token exchange tests"
+out=$(go test ./server/ ./server/workload/ ./server/grants/ -count=1 \
+  -run 'Workload|TestNewValidatesConfig|TestExchangeRefusesMalformedActorTokens' -v)
+echo "$out" | grep -E -- '^--- (PASS|FAIL)'
+for t in TestNewValidatesConfig TestExchangeRefusesMalformedActorTokens TestWorkloadExchange \
+  TestWorkloadPackageHasNoKubernetesAPI TestHandleWorkloadTokenExchange; do
   grep -q -- "--- PASS: $t " <<< "$out" || { echo "test: $t did not run and pass" >&2; exit 1; }
 done
 

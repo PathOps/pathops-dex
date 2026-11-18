@@ -1,0 +1,1153 @@
+From 3290d8daec64d2629affa85ad2337bcf75495f2f Mon Sep 17 00:00:00 2001
+From: PathOps <noreply@pathops.dev>
+Date: Wed, 18 Nov 2026 18:06:03 -0300
+Subject: [PATCH 6/6] workload: generic workload token exchange
+
+PathOps Decision 0065: one generic RFC 8693 workload token exchange
+replaces the service-specific registry and Artifact Store token profiles.
+Dex no longer derives an Application from Kubernetes names or labels and
+no longer reads the Kubernetes API.
+
+A configured confidential client (the PathOps Tenant Control Plane)
+exchanges:
+
+  subject_token  a workload token (ID token type), verified by the
+                 configured subject connector: issuer, signature, expiry
+                 and audience (patch 0001's subjectTokenAudiences)
+  actor_token    an EdDSA JWT of a trusted actor (issuer, audience, kid,
+                 lifetime at most 5 minutes) whose subject_token_hash is
+                 base64url(SHA-256(subject_token)) and whose
+                 target_audience is the requested audience
+  audience       a configured output
+
+for a JWT signed with the output's own Ed25519 key, with the output's
+issuer and audience, the subject's identity as sub, at most the output's
+maxLifetime (less when the actor's token_lifetime asks for less), and the
+claims the output lists copied unchanged from the actor's authorization
+object. Dex does not interpret those claims; the actor already decided
+them. A token exchange with an actor_token is answered only by this grant
+(unsupported when it is not configured).
+
+Configuration (opt-in; without it nothing changes):
+
+  workloadTokenExchange:
+    clients: [pathops-tenant-control-plane]
+    subjectConnector: k8s-cell
+    actors:
+      - issuer: pathops-tenant-control-plane
+        audience: pathops-workload-exchange
+        keys: [{kid: tcp-workload-1, ed25519: <base64url public key>}]
+    outputs:
+      - audience: pathops-registry
+        issuer: https://dex.example.org/registry
+        signingKeyFile: /etc/dex/registry/registry.key
+        keyID: registry-1
+        maxLifetime: 30m
+        claims: [access, pathops_application]
+---
+ cmd/dex/config.go                    |   5 +
+ cmd/dex/serve.go                     |  15 +
+ server/config.go                     |   5 +
+ server/grants/grants.go              |  17 ++
+ server/grants/workload.go            |  93 +++++++
+ server/grants/workload_test.go       | 271 ++++++++++++++++++
+ server/server.go                     |   1 +
+ server/server_grant_workload_test.go |  79 ++++++
+ server/workload/workload.go          | 392 +++++++++++++++++++++++++++
+ server/workload/workload_test.go     |  67 +++++
+ 10 files changed, 945 insertions(+)
+ create mode 100644 server/grants/workload.go
+ create mode 100644 server/grants/workload_test.go
+ create mode 100644 server/server_grant_workload_test.go
+ create mode 100644 server/workload/workload.go
+ create mode 100644 server/workload/workload_test.go
+
+diff --git a/cmd/dex/config.go b/cmd/dex/config.go
+index 6a45554..b89a649 100644
+--- a/cmd/dex/config.go
++++ b/cmd/dex/config.go
+@@ -20,6 +20,7 @@ import (
+ 	"github.com/dexidp/dex/server/connectors"
+ 	"github.com/dexidp/dex/server/delegation"
+ 	"github.com/dexidp/dex/server/signer"
++	"github.com/dexidp/dex/server/workload"
+ 	"github.com/dexidp/dex/storage"
+ 	"github.com/dexidp/dex/storage/ent"
+ 	"github.com/dexidp/dex/storage/etcd"
+@@ -79,6 +80,10 @@ type Config struct {
+ 
+ 	// Delegation enables PathOps operation-scoped delegated authorization.
+ 	Delegation *delegation.Config `json:"delegation"`
++
++	// WorkloadTokenExchange enables the PathOps generic workload token
++	// exchange (subject token + bound actor token).
++	WorkloadTokenExchange *workload.Config `json:"workloadTokenExchange"`
+ }
+ 
+ // MFAConfig holds multi-factor authentication settings.
+diff --git a/cmd/dex/serve.go b/cmd/dex/serve.go
+index bf755c8..0edb7ba 100644
+--- a/cmd/dex/serve.go
++++ b/cmd/dex/serve.go
+@@ -48,6 +48,7 @@ import (
+ 	"github.com/dexidp/dex/server/session"
+ 	"github.com/dexidp/dex/server/signer"
+ 	"github.com/dexidp/dex/server/tokens"
++	"github.com/dexidp/dex/server/workload"
+ 	"github.com/dexidp/dex/storage"
+ )
+ 
+@@ -413,6 +414,20 @@ func runServe(options serveOptions) error {
+ 			"grants_valid_for", policy.GrantsValidFor(), "tokens_valid_for", policy.TokensValidFor())
+ 	}
+ 
++	if c.WorkloadTokenExchange != nil {
++		exchanger, err := workload.New(*c.WorkloadTokenExchange)
++		if err != nil {
++			return fmt.Errorf("invalid workloadTokenExchange config: %v", err)
++		}
++		serverConfig.Workload = exchanger
++		outputs := make([]string, 0, len(c.WorkloadTokenExchange.Outputs))
++		for _, o := range c.WorkloadTokenExchange.Outputs {
++			outputs = append(outputs, o.Audience+"<="+o.MaxLifetime)
++		}
++		logger.Info("config workload token exchange", "clients", c.WorkloadTokenExchange.Clients,
++			"subject_connector", c.WorkloadTokenExchange.SubjectConnector, "actors", len(c.WorkloadTokenExchange.Actors), "outputs", outputs)
++	}
++
+ 	if c.Expiry.AuthRequests != "" {
+ 		authRequests, err := time.ParseDuration(c.Expiry.AuthRequests)
+ 		if err != nil {
+diff --git a/server/config.go b/server/config.go
+index bd9174b..6ec3060 100644
+--- a/server/config.go
++++ b/server/config.go
+@@ -23,6 +23,7 @@ import (
+ 	"github.com/dexidp/dex/server/signer"
+ 	"github.com/dexidp/dex/server/templates"
+ 	"github.com/dexidp/dex/server/tokens"
++	"github.com/dexidp/dex/server/workload"
+ 	"github.com/dexidp/dex/storage"
+ 	"github.com/dexidp/dex/web"
+ )
+@@ -65,6 +66,10 @@ type Config struct {
+ 	// signed Authorization Plans, operation grants). Nil: disabled.
+ 	Delegation *delegation.Policy
+ 
++	// Workload serves the PathOps generic workload token exchange. Nil:
++	// disabled.
++	Workload *workload.Exchanger
++
+ 	// If enabled, the connectors selection page will always be shown even if there's only one
+ 	AlwaysShowLoginScreen bool
+ 
+diff --git a/server/grants/grants.go b/server/grants/grants.go
+index 1259e05..fedbe67 100644
+--- a/server/grants/grants.go
++++ b/server/grants/grants.go
+@@ -20,6 +20,7 @@ import (
+ 	"github.com/dexidp/dex/server/session"
+ 	"github.com/dexidp/dex/server/signer"
+ 	"github.com/dexidp/dex/server/tokens"
++	"github.com/dexidp/dex/server/workload"
+ 	"github.com/dexidp/dex/storage"
+ )
+ 
+@@ -51,6 +52,10 @@ type Request struct {
+ 	SubjectToken       string
+ 	SubjectTokenType   string
+ 	RequestedTokenType string
++	// ActorToken and ActorTokenType (RFC 8693 §2.1): the bound actor of a
++	// PathOps workload token exchange.
++	ActorToken     string
++	ActorTokenType string
+ 	// Audience and AuthorizationDetails (RFC 8693, RFC 9396): the target and
+ 	// the details of a PathOps delegated derivation.
+ 	Audience             string
+@@ -83,6 +88,8 @@ func parseRequest(r *http.Request) (*Request, *oauth2.Error) {
+ 		SubjectToken:       r.PostFormValue("subject_token"),
+ 		SubjectTokenType:   r.PostFormValue("subject_token_type"),
+ 		RequestedTokenType: r.PostFormValue("requested_token_type"),
++		ActorToken:         r.PostFormValue("actor_token"),
++		ActorTokenType:     r.PostFormValue("actor_token_type"),
+ 
+ 		Audience:             r.PostFormValue("audience"),
+ 		AuthorizationDetails: r.PostFormValue("authorization_details"),
+@@ -175,6 +182,9 @@ type Handler struct {
+ 	Delegation *delegation.Policy
+ 	Signer     signer.Signer
+ 	IssuerURL  string
++	// Workload serves the PathOps generic workload token exchange (nil:
++	// disabled): a token exchange with an actor token.
++	Workload *workload.Exchanger
+ 
+ 	grants map[string]Grant
+ }
+@@ -205,6 +215,9 @@ func (h *Handler) Mount(m router.Mux) {
+ 		h.grants[delegatedGrantType] = &delegatedExchange{policy: h.Delegation, storage: h.Storage, signer: h.Signer,
+ 			issuer: h.IssuerURL, now: h.Now, logger: h.Logger}
+ 	}
++	if h.Workload != nil && slices.Contains(h.SupportedGrantTypes, oauth2.GrantTypeTokenExchange) {
++		h.grants[workloadGrantType] = &workloadExchange{exchanger: h.Workload, logger: h.Logger}
++	}
+ 	m.HandleCORS("/token", h.handleToken)
+ }
+ 
+@@ -226,6 +239,10 @@ func (h *Handler) handleToken(w http.ResponseWriter, r *http.Request) {
+ 	grantType := r.PostFormValue("grant_type")
+ 	if grantType == oauth2.GrantTypeTokenExchange && r.PostFormValue("subject_token_type") == delegation.OperationGrantTokenType {
+ 		grantType = delegatedGrantType
++	} else if grantType == oauth2.GrantTypeTokenExchange && r.PostFormValue("actor_token") != "" {
++		// Upstream token exchange ignores actor_token; with one, only the
++		// workload exchange may answer (unsupported when it is disabled).
++		grantType = workloadGrantType
+ 	}
+ 	if !h.dispatch(w, r, grantType) {
+ 		h.Logger.ErrorContext(ctx, "unsupported grant type", "grant_type", grantType)
+diff --git a/server/grants/workload.go b/server/grants/workload.go
+new file mode 100644
+index 0000000..6abc03c
+--- /dev/null
++++ b/server/grants/workload.go
+@@ -0,0 +1,93 @@
++package grants
++
++import (
++	"context"
++	"errors"
++	"log/slog"
++	"net/http"
++	"time"
++
++	"github.com/dexidp/dex/connector"
++	"github.com/dexidp/dex/server/connectors"
++	"github.com/dexidp/dex/server/oauth2"
++	"github.com/dexidp/dex/server/tokens"
++	"github.com/dexidp/dex/server/workload"
++	"github.com/dexidp/dex/storage"
++)
++
++// workloadGrantType is the internal key of the PathOps generic workload token
++// exchange: an RFC 8693 token exchange with an actor_token.
++const workloadGrantType = "pathops:workload-exchange"
++
++// workloadExchange issues a short-lived token of a configured audience for a
++// workload subject token, on the authority of a bound actor token
++// (workload.Exchanger). Only configured confidential clients may ask.
++type workloadExchange struct {
++	exchanger *workload.Exchanger
++	logger    *slog.Logger
++}
++
++func (g *workloadExchange) GrantType() string { return workloadGrantType }
++
++func (g *workloadExchange) RequiresClientAuth() bool { return true }
++
++// ScopePolicy passes scopes through: an issued token carries no scope.
++func (g *workloadExchange) ScopePolicy() ScopePolicy { return ScopePolicy{} }
++
++// ConnectorID is the configured subject connector; a request naming another
++// one is refused.
++func (g *workloadExchange) ConnectorID(_ context.Context, req *Request, _ storage.Client) (string, *oauth2.Error) {
++	if req.ConnectorID != "" && req.ConnectorID != g.exchanger.Connector() {
++		return "", &oauth2.Error{Type: oauth2.InvalidRequest, Description: "connector_id is not the workload subject connector",
++			Status: http.StatusBadRequest}
++	}
++	return g.exchanger.Connector(), nil
++}
++
++func (g *workloadExchange) Authorize(ctx context.Context, req *Request, client storage.Client, conn connectors.Connector) (Responder, error) {
++	denied := &oauth2.Error{Type: oauth2.AccessDenied, Status: http.StatusForbidden}
++	if client.Public || !g.exchanger.Client(client.ID) {
++		g.logger.WarnContext(ctx, "workload token exchange refused: client", "client_id", client.ID)
++		return nil, &oauth2.Error{Type: "unauthorized_client", Description: "this client may not exchange workload tokens",
++			Status: http.StatusBadRequest}
++	}
++	switch {
++	case req.SubjectTokenType != oauth2.TokenTypeID:
++		return nil, &oauth2.Error{Type: oauth2.InvalidRequest, Description: "subject_token_type must be an ID token", Status: http.StatusBadRequest}
++	case req.ActorTokenType != workload.ActorTokenType:
++		return nil, &oauth2.Error{Type: oauth2.InvalidRequest, Description: "actor_token_type must be a JWT", Status: http.StatusBadRequest}
++	case req.SubjectToken == "" || req.ActorToken == "" || req.Audience == "":
++		return nil, &oauth2.Error{Type: oauth2.InvalidRequest, Description: "subject_token, actor_token and audience are required",
++			Status: http.StatusBadRequest}
++	case req.RequestedTokenType != "" && req.RequestedTokenType != workload.IssuedTokenType:
++		return nil, &oauth2.Error{Type: oauth2.InvalidRequest, Description: "requested_token_type must be a JWT", Status: http.StatusBadRequest}
++	}
++	teConn, ok := conn.Connector.(connector.TokenIdentityConnector)
++	if !ok {
++		g.logger.ErrorContext(ctx, "workload subject connector does not verify tokens", "connector_id", g.exchanger.Connector())
++		return nil, &oauth2.Error{Type: oauth2.ServerError, Status: http.StatusInternalServerError}
++	}
++	identity, err := teConn.TokenIdentity(ctx, req.SubjectTokenType, req.SubjectToken)
++	if err != nil {
++		g.logger.WarnContext(ctx, "workload token exchange refused: subject token", "client_id", client.ID, "err", err)
++		return nil, denied
++	}
++	issued, err := g.exchanger.Exchange(req.SubjectToken, identity.UserID, req.ActorToken, req.Audience)
++	if errors.Is(err, workload.ErrDenied) {
++		g.logger.WarnContext(ctx, "workload token exchange refused", "client_id", client.ID, "user_id", identity.UserID,
++			"audience", req.Audience, "err", err)
++		return nil, denied
++	}
++	if err != nil {
++		g.logger.ErrorContext(ctx, "workload token exchange failed", "client_id", client.ID, "err", err)
++		return nil, &oauth2.Error{Type: oauth2.ServerError, Status: http.StatusInternalServerError}
++	}
++	g.logger.InfoContext(ctx, "workload token issued", "client_id", client.ID, "actor", issued.Actor, "user_id", identity.UserID,
++		"audience", issued.Audience, "expiry", issued.Expiry.Format(time.RFC3339))
++	return tokens.Response{
++		AccessToken:     issued.Token,
++		IssuedTokenType: workload.IssuedTokenType,
++		TokenType:       "bearer",
++		ExpiresIn:       int(time.Until(issued.Expiry).Seconds()),
++	}, nil
++}
+diff --git a/server/grants/workload_test.go b/server/grants/workload_test.go
+new file mode 100644
+index 0000000..feb7062
+--- /dev/null
++++ b/server/grants/workload_test.go
+@@ -0,0 +1,271 @@
++package grants
++
++import (
++	"crypto/ed25519"
++	"crypto/rand"
++	"crypto/rsa"
++	"crypto/sha256"
++	"encoding/base64"
++	"encoding/json"
++	"io"
++	"log/slog"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/go-jose/go-jose/v4"
++	"github.com/stretchr/testify/require"
++
++	"github.com/dexidp/dex/connector/oidc"
++	"github.com/dexidp/dex/server/connectors"
++	"github.com/dexidp/dex/server/oauth2"
++	"github.com/dexidp/dex/server/tokens"
++	"github.com/dexidp/dex/server/workload"
++	"github.com/dexidp/dex/storage"
++)
++
++// kubernetesIssuer is a stand-in for a Cell's Kubernetes ServiceAccount
++// issuer: OIDC discovery and JWKS over HTTP, RS256 tokens.
++type kubernetesIssuer struct {
++	srv *httptest.Server
++	key *rsa.PrivateKey
++}
++
++func newKubernetesIssuer(t *testing.T) *kubernetesIssuer {
++	key, err := rsa.GenerateKey(rand.Reader, 2048)
++	require.NoError(t, err)
++	k := &kubernetesIssuer{key: key}
++	mux := http.NewServeMux()
++	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
++		json.NewEncoder(w).Encode(map[string]any{"issuer": k.srv.URL, "jwks_uri": k.srv.URL + "/openid/v1/jwks",
++			"authorization_endpoint": k.srv.URL + "/authorize", "token_endpoint": k.srv.URL + "/token",
++			"id_token_signing_alg_values_supported": []string{"RS256"}, "response_types_supported": []string{"id_token"},
++			"subject_types_supported": []string{"public"}})
++	})
++	mux.HandleFunc("/openid/v1/jwks", func(w http.ResponseWriter, _ *http.Request) {
++		json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &key.PublicKey, KeyID: "k8s-1", Algorithm: "RS256", Use: "sig"}}})
++	})
++	k.srv = httptest.NewServer(mux)
++	t.Cleanup(k.srv.Close)
++	return k
++}
++
++// token is a ServiceAccount token of subject for audience, valid until exp,
++// signed with key (nil: the issuer's key).
++func (k *kubernetesIssuer) token(t *testing.T, subject, audience string, exp time.Time, key *rsa.PrivateKey) string {
++	if key == nil {
++		key = k.key
++	}
++	s, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: jose.JSONWebKey{Key: key, KeyID: "k8s-1"}}, nil)
++	require.NoError(t, err)
++	now := time.Now()
++	body, _ := json.Marshal(map[string]any{"iss": k.srv.URL, "sub": subject, "aud": []string{audience},
++		"iat": now.Add(-time.Minute).Unix(), "nbf": now.Add(-time.Minute).Unix(), "exp": exp.Unix()})
++	jws, err := s.Sign(body)
++	require.NoError(t, err)
++	out, err := jws.CompactSerialize()
++	require.NoError(t, err)
++	return out
++}
++
++const (
++	exchangeAudience = "pathops-workload-exchange"
++	actorIssuer      = "pathops-tenant-control-plane"
++	appA             = "11111111-1111-4111-8111-111111111111"
++	saA              = "system:serviceaccount:a-build:a-build"
++)
++
++type actorKey struct {
++	kid string
++	key ed25519.PrivateKey
++}
++
++// actor signs an actor token with claims over the defaults.
++func (a actorKey) sign(t *testing.T, claims map[string]any) string {
++	now := time.Now()
++	c := map[string]any{"iss": actorIssuer, "aud": exchangeAudience, "iat": now.Unix(), "exp": now.Add(2 * time.Minute).Unix()}
++	for k, v := range claims {
++		if v == nil {
++			delete(c, k)
++		} else {
++			c[k] = v
++		}
++	}
++	h, _ := json.Marshal(map[string]string{"alg": "EdDSA", "typ": "JWT", "kid": a.kid})
++	b, _ := json.Marshal(c)
++	in := base64.RawURLEncoding.EncodeToString(h) + "." + base64.RawURLEncoding.EncodeToString(b)
++	return in + "." + base64.RawURLEncoding.EncodeToString(ed25519.Sign(a.key, []byte(in)))
++}
++
++func hashOf(token string) string {
++	s := sha256.Sum256([]byte(token))
++	return base64.RawURLEncoding.EncodeToString(s[:])
++}
++
++func claimsOf(t *testing.T, token string) map[string]any {
++	parts := strings.Split(token, ".")
++	require.Len(t, parts, 3)
++	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
++	require.NoError(t, err)
++	var c map[string]any
++	require.NoError(t, json.Unmarshal(raw, &c))
++	return c
++}
++
++// TestWorkloadExchange runs the grant with a real OIDC connector (the
++// PathOps subjectTokenAudiences check) against a Kubernetes-like issuer: the
++// subject token's signature, issuer, audience and expiry are the connector's;
++// the actor token's and the binding are the exchanger's. Nothing reaches a
++// Kubernetes API: the issuer serves only discovery and JWKS.
++func TestWorkloadExchange(t *testing.T) {
++	k8s := newKubernetesIssuer(t)
++	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
++	// Not in a cluster: no Kubernetes API is reachable from this test.
++	t.Setenv("KUBERNETES_SERVICE_HOST", "")
++	conn, err := (&oidc.Config{Issuer: k8s.srv.URL, ClientID: exchangeAudience, SubjectTokenAudiences: []string{exchangeAudience},
++		UserIDKey: "sub", UserNameKey: "sub", Scopes: []string{"openid"}}).Open("k8s-cell", logger)
++	require.NoError(t, err)
++
++	pubA, privA, _ := ed25519.GenerateKey(rand.Reader)
++	_, rogue, _ := ed25519.GenerateKey(rand.Reader)
++	_, outKey, _ := ed25519.GenerateKey(rand.Reader)
++	_, artKey, _ := ed25519.GenerateKey(rand.Reader)
++	ex, err := workload.NewWithKeys(workload.Config{
++		Clients:          []string{"pathops-tenant-control-plane"},
++		SubjectConnector: "k8s-cell",
++		Actors: []workload.ActorConfig{{Issuer: actorIssuer, Audience: exchangeAudience,
++			Keys: []workload.KeyConfig{{KeyID: "tcp-workload-1", Ed25519: base64.RawURLEncoding.EncodeToString(pubA)}}}},
++		Outputs: []workload.OutputConfig{
++			{Audience: "pathops-registry", Issuer: "https://dex.example.org/registry", KeyID: "registry-1", MaxLifetime: "30m",
++				Claims: []string{"access", "pathops_application"}},
++			{Audience: "pathops-artifact-store", Issuer: "https://dex.example.org/artifacts", KeyID: "artifact-1", MaxLifetime: "5m",
++				Claims: []string{"pathops_application", "pathops_operations"}},
++		},
++	}, map[string]ed25519.PrivateKey{"pathops-registry": outKey, "pathops-artifact-store": artKey})
++	require.NoError(t, err)
++	g := &workloadExchange{exchanger: ex, logger: logger}
++	tcp := storage.Client{ID: "pathops-tenant-control-plane", Secret: "s"}
++	actor := actorKey{kid: "tcp-workload-1", key: privA}
++
++	subject := k8s.token(t, saA, exchangeAudience, time.Now().Add(10*time.Minute), nil)
++	authz := map[string]any{"pathops_application": appA,
++		"access":  []any{map[string]any{"type": "repository", "name": "apps/" + appA, "actions": []any{"pull", "push"}}},
++		"ignored": "not copied"}
++	good := map[string]any{"subject_token_hash": hashOf(subject), "target_audience": "pathops-registry", "authorization": authz}
++
++	request := func(subject, actorToken, audience string) *Request {
++		return &Request{SubjectToken: subject, SubjectTokenType: oauth2.TokenTypeID, ActorToken: actorToken,
++			ActorTokenType: workload.ActorTokenType, Audience: audience}
++	}
++	call := func(req *Request, client storage.Client) (tokens.Response, error) {
++		resp, err := g.Authorize(t.Context(), req, client, connectors.Connector{Connector: conn})
++		if err != nil {
++			return tokens.Response{}, err
++		}
++		return resp.(tokens.Response), nil
++	}
++	deny := func(t *testing.T, req *Request, client storage.Client) {
++		t.Helper()
++		_, err := call(req, client)
++		var oe *oauth2.Error
++		require.ErrorAs(t, err, &oe)
++		require.NotEqual(t, http.StatusOK, oe.Status)
++	}
++	with := func(over map[string]any) map[string]any {
++		c := map[string]any{}
++		for k, v := range good {
++			c[k] = v
++		}
++		for k, v := range over {
++			c[k] = v
++		}
++		return c
++	}
++
++	t.Run("valid subject, valid actor, matching hash: a token of the output audience", func(t *testing.T) {
++		res, err := call(request(subject, actor.sign(t, good), "pathops-registry"), tcp)
++		require.NoError(t, err)
++		require.Equal(t, workload.IssuedTokenType, res.IssuedTokenType)
++		require.LessOrEqual(t, res.ExpiresIn, 1800)
++		require.Greater(t, res.ExpiresIn, 1700)
++		c := claimsOf(t, res.AccessToken)
++		require.Equal(t, "https://dex.example.org/registry", c["iss"])
++		require.Equal(t, "pathops-registry", c["aud"])
++		require.Equal(t, saA, c["sub"])
++		require.Equal(t, appA, c["pathops_application"])
++		require.Equal(t, authz["access"], c["access"])
++		require.NotContains(t, c, "ignored")
++		require.NotContains(t, c, "authorization")
++		parts := strings.Split(res.AccessToken, ".")
++		sig, _ := base64.RawURLEncoding.DecodeString(parts[2])
++		require.True(t, ed25519.Verify(outKey.Public().(ed25519.PublicKey), []byte(parts[0]+"."+parts[1]), sig))
++	})
++	t.Run("the actor may ask for a shorter lifetime, never a longer one", func(t *testing.T) {
++		res, err := call(request(subject, actor.sign(t, with(map[string]any{"token_lifetime": 300})), "pathops-registry"), tcp)
++		require.NoError(t, err)
++		require.LessOrEqual(t, res.ExpiresIn, 300)
++		res, err = call(request(subject, actor.sign(t, with(map[string]any{"token_lifetime": 7200})), "pathops-registry"), tcp)
++		require.NoError(t, err)
++		require.LessOrEqual(t, res.ExpiresIn, 1800)
++	})
++	t.Run("invalid subject signature", func(t *testing.T) {
++		other, _ := rsa.GenerateKey(rand.Reader, 2048)
++		bad := k8s.token(t, saA, exchangeAudience, time.Now().Add(10*time.Minute), other)
++		deny(t, request(bad, actor.sign(t, with(map[string]any{"subject_token_hash": hashOf(bad)})), "pathops-registry"), tcp)
++	})
++	t.Run("expired subject", func(t *testing.T) {
++		old := k8s.token(t, saA, exchangeAudience, time.Now().Add(-time.Minute), nil)
++		deny(t, request(old, actor.sign(t, with(map[string]any{"subject_token_hash": hashOf(old)})), "pathops-registry"), tcp)
++	})
++	t.Run("subject for another audience", func(t *testing.T) {
++		wrong := k8s.token(t, saA, "https://dex.identity.svc.cluster.local:5556", time.Now().Add(10*time.Minute), nil)
++		deny(t, request(wrong, actor.sign(t, with(map[string]any{"subject_token_hash": hashOf(wrong)})), "pathops-registry"), tcp)
++	})
++	t.Run("invalid actor signature", func(t *testing.T) {
++		deny(t, request(subject, actorKey{kid: "tcp-workload-1", key: rogue}.sign(t, good), "pathops-registry"), tcp)
++		deny(t, request(subject, actorKey{kid: "other", key: privA}.sign(t, good), "pathops-registry"), tcp)
++	})
++	t.Run("expired actor", func(t *testing.T) {
++		past := time.Now().Add(-10 * time.Minute)
++		deny(t, request(subject, actor.sign(t, with(map[string]any{"iat": past.Unix(), "exp": past.Add(2 * time.Minute).Unix()})),
++			"pathops-registry"), tcp)
++	})
++	t.Run("actor lives too long", func(t *testing.T) {
++		deny(t, request(subject, actor.sign(t, with(map[string]any{"exp": time.Now().Add(time.Hour).Unix()})), "pathops-registry"), tcp)
++	})
++	t.Run("actor for another audience or from another issuer", func(t *testing.T) {
++		deny(t, request(subject, actor.sign(t, with(map[string]any{"aud": "pathops-registry"})), "pathops-registry"), tcp)
++		deny(t, request(subject, actor.sign(t, with(map[string]any{"iss": "someone-else"})), "pathops-registry"), tcp)
++	})
++	t.Run("actor hash is not the subject's", func(t *testing.T) {
++		otherSubject := k8s.token(t, "system:serviceaccount:b-build:b-build", exchangeAudience, time.Now().Add(10*time.Minute), nil)
++		// Application B's subject token with Application A's actor token.
++		deny(t, request(otherSubject, actor.sign(t, good), "pathops-registry"), tcp)
++		deny(t, request(subject, actor.sign(t, with(map[string]any{"subject_token_hash": nil})), "pathops-registry"), tcp)
++	})
++	t.Run("actor names another output audience", func(t *testing.T) {
++		deny(t, request(subject, actor.sign(t, good), "pathops-artifact-store"), tcp)
++		deny(t, request(subject, actor.sign(t, with(map[string]any{"target_audience": "unknown"})), "unknown"), tcp)
++	})
++	t.Run("no authorization object", func(t *testing.T) {
++		deny(t, request(subject, actor.sign(t, with(map[string]any{"authorization": nil})), "pathops-registry"), tcp)
++	})
++	t.Run("only configured confidential clients", func(t *testing.T) {
++		deny(t, request(subject, actor.sign(t, good), "pathops-registry"), storage.Client{ID: "zot", Public: true})
++		deny(t, request(subject, actor.sign(t, good), "pathops-registry"), storage.Client{ID: "pathops-cli", Secret: "s"})
++	})
++}
++
++// TestWorkloadPackageHasNoKubernetesAPI: the exchanger never reads Kubernetes
++// objects (PathOps Decision 0065): its source neither reaches an API server
++// nor knows PathOps naming.
++func TestWorkloadPackageHasNoKubernetesAPI(t *testing.T) {
++	src, err := os.ReadFile("../workload/workload.go")
++	require.NoError(t, err)
++	for _, s := range []string{"KUBERNETES_SERVICE", "net/http", "serviceaccount/token", "/api/v1/", "pathops.io/", "-build", "-ci\""} {
++		require.NotContains(t, string(src), s)
++	}
++}
+diff --git a/server/server.go b/server/server.go
+index 4985756..b4ab731 100644
+--- a/server/server.go
++++ b/server/server.go
+@@ -257,6 +257,7 @@ func (s *Server) mount(routes router.Mux, c Config, rc resolvedConfig) {
+ 			Delegation:          c.Delegation,
+ 			Signer:              c.Signer,
+ 			IssuerURL:           s.issuerURL.String(),
++			Workload:            c.Workload,
+ 		},
+ 		&userinfo.Handler{
+ 			Issuer: s.issuerURL.String(),
+diff --git a/server/server_grant_workload_test.go b/server/server_grant_workload_test.go
+new file mode 100644
+index 0000000..a6b5fb5
+--- /dev/null
++++ b/server/server_grant_workload_test.go
+@@ -0,0 +1,79 @@
++package server
++
++import (
++	"crypto/ed25519"
++	"crypto/rand"
++	"crypto/sha256"
++	"encoding/base64"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++
++	"github.com/dexidp/dex/server/oauth2"
++	"github.com/dexidp/dex/server/tokens"
++	"github.com/dexidp/dex/server/workload"
++	"github.com/dexidp/dex/storage"
++)
++
++// TestHandleWorkloadTokenExchange: a token exchange with an actor_token is
++// answered only by the workload exchange (not by the upstream grant, which
++// would ignore the actor), and only when it is configured.
++func TestHandleWorkloadTokenExchange(t *testing.T) {
++	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
++	_, out, _ := ed25519.GenerateKey(rand.Reader)
++	ex, err := workload.NewWithKeys(workload.Config{
++		Clients: []string{"tcp"}, SubjectConnector: "mock",
++		Actors: []workload.ActorConfig{{Issuer: "pathops-tenant-control-plane", Audience: "pathops-workload-exchange",
++			Keys: []workload.KeyConfig{{KeyID: "k1", Ed25519: base64.RawURLEncoding.EncodeToString(pub)}}}},
++		Outputs: []workload.OutputConfig{{Audience: "pathops-registry", Issuer: "https://dex.example.org/registry", KeyID: "r1",
++			MaxLifetime: "5m", Claims: []string{"access"}}},
++	}, map[string]ed25519.PrivateKey{"pathops-registry": out})
++	require.NoError(t, err)
++
++	const subject = "subject-token"
++	sum := sha256.Sum256([]byte(subject))
++	now := time.Now()
++	h, _ := json.Marshal(map[string]string{"alg": "EdDSA", "kid": "k1"})
++	b, _ := json.Marshal(map[string]any{"iss": "pathops-tenant-control-plane", "aud": "pathops-workload-exchange",
++		"iat": now.Unix(), "exp": now.Add(time.Minute).Unix(), "subject_token_hash": base64.RawURLEncoding.EncodeToString(sum[:]),
++		"target_audience": "pathops-registry", "authorization": map[string]any{"access": []any{}}})
++	in := base64.RawURLEncoding.EncodeToString(h) + "." + base64.RawURLEncoding.EncodeToString(b)
++	actor := in + "." + base64.RawURLEncoding.EncodeToString(ed25519.Sign(priv, []byte(in)))
++
++	post := func(t *testing.T, enabled bool, client, secret string) *httptest.ResponseRecorder {
++		httpServer, s := newTestServer(t, func(c *Config) {
++			if enabled {
++				c.Workload = ex
++			}
++			c.Storage.CreateClient(t.Context(), storage.Client{ID: "tcp", Secret: "secret"})
++			c.Storage.CreateClient(t.Context(), storage.Client{ID: "other", Secret: "secret"})
++		})
++		defer httpServer.Close()
++		vals := url.Values{"grant_type": {oauth2.GrantTypeTokenExchange}, "subject_token": {subject},
++			"subject_token_type": {oauth2.TokenTypeID}, "actor_token": {actor}, "actor_token_type": {workload.ActorTokenType},
++			"audience": {"pathops-registry"}, "client_id": {client}, "client_secret": {secret}}
++		rr := httptest.NewRecorder()
++		req := httptest.NewRequest(http.MethodPost, httpServer.URL+"/token", strings.NewReader(vals.Encode()))
++		req.Header.Set("content-type", "application/x-www-form-urlencoded")
++		s.ServeHTTP(rr, req)
++		return rr
++	}
++
++	rr := post(t, true, "tcp", "secret")
++	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
++	var res tokens.Response
++	require.NoError(t, json.NewDecoder(rr.Body).Decode(&res))
++	require.Equal(t, workload.IssuedTokenType, res.IssuedTokenType)
++
++	require.Equal(t, http.StatusUnauthorized, post(t, true, "tcp", "wrong").Code)
++	require.Equal(t, http.StatusBadRequest, post(t, true, "other", "secret").Code)
++	rr = post(t, false, "tcp", "secret")
++	require.Equal(t, http.StatusBadRequest, rr.Code)
++	require.Contains(t, rr.Body.String(), "unsupported_grant_type")
++}
+diff --git a/server/workload/workload.go b/server/workload/workload.go
+new file mode 100644
+index 0000000..bb5faf0
+--- /dev/null
++++ b/server/workload/workload.go
+@@ -0,0 +1,392 @@
++// Package workload is the PathOps generic workload token exchange (PathOps
++// Decision 0065): an RFC 8693 token exchange with both a subject token and
++// an actor token, for a short-lived token of a configured output audience.
++//
++//	subject_token  a workload's token, verified by the configured connector
++//	               (issuer, signature, audience, expiry)
++//	actor_token    a short-lived JWT signed by a trusted actor (an Ed25519 key
++//	               configured here), whose "subject_token_hash" binds it to
++//	               exactly that subject token: base64url(SHA-256(subject_token))
++//	audience       the requested output audience, which the actor must name
++//	               too ("target_audience")
++//
++// The issued token is a JWT signed with the output's own Ed25519 key (never
++// Dex's OIDC keys), with the output's issuer and audience, the subject's
++// identity as "sub", a lifetime of at most the output's maximum (and of at
++// most the actor's "token_lifetime" in seconds, when it asks for less), and
++// the claims the output configuration lists copied unchanged from the
++// actor's "authorization" object.
++//
++// Dex does not interpret those claims: the actor (the PathOps Tenant Control
++// Plane) has already decided them. Dex only proves who signed them, that
++// they belong to this subject token and that they are fresh, and limits the
++// audience and lifetime of what it issues.
++package workload
++
++import (
++	"crypto/ed25519"
++	"crypto/rand"
++	"crypto/sha256"
++	"crypto/subtle"
++	"crypto/x509"
++	"encoding/base64"
++	"encoding/hex"
++	"encoding/json"
++	"encoding/pem"
++	"errors"
++	"fmt"
++	"net/url"
++	"os"
++	"regexp"
++	"slices"
++	"strings"
++	"time"
++)
++
++// ActorTokenType is the actor_token_type of an actor token (RFC 8693 §3).
++const ActorTokenType = "urn:ietf:params:oauth:token-type:jwt"
++
++// IssuedTokenType is the issued_token_type of an issued token.
++const IssuedTokenType = "urn:ietf:params:oauth:token-type:jwt"
++
++// Actor token claims with a meaning here.
++const (
++	ClaimSubjectTokenHash = "subject_token_hash"
++	ClaimTargetAudience   = "target_audience"
++	ClaimTokenLifetime    = "token_lifetime"
++	ClaimAuthorization    = "authorization"
++)
++
++// maxActorLifetime bounds an actor token's own lifetime.
++const maxActorLifetime = 5 * time.Minute
++
++// clockSkew tolerated on iat/nbf of actor tokens.
++const clockSkew = 30 * time.Second
++
++// Config is the "workloadTokenExchange" section of the Dex configuration.
++type Config struct {
++	// Clients are the confidential OAuth clients that may exchange.
++	Clients []string `json:"clients"`
++	// SubjectConnector verifies subject tokens (its own issuer and audience
++	// checks apply).
++	SubjectConnector string `json:"subjectConnector"`
++	// Actors are the trusted actor token issuers.
++	Actors []ActorConfig `json:"actors"`
++	// Outputs are the audiences of tokens that may be issued.
++	Outputs []OutputConfig `json:"outputs"`
++}
++
++// ActorConfig is one trusted actor token issuer.
++type ActorConfig struct {
++	Issuer   string      `json:"issuer"`
++	Audience string      `json:"audience"`
++	Keys     []KeyConfig `json:"keys"`
++}
++
++// KeyConfig is an Ed25519 public key.
++type KeyConfig struct {
++	KeyID string `json:"kid"`
++	// Ed25519 is the raw 32-byte public key, base64url (a JWK OKP "x").
++	Ed25519 string `json:"ed25519"`
++}
++
++// OutputConfig is one audience of issued tokens.
++type OutputConfig struct {
++	Audience string `json:"audience"`
++	Issuer   string `json:"issuer"`
++	// SigningKeyFile is the Ed25519 private key (PEM, PKCS#8); KeyID its "kid".
++	SigningKeyFile string `json:"signingKeyFile"`
++	KeyID          string `json:"keyID"`
++	// MaxLifetime bounds issued tokens (at most 1h).
++	MaxLifetime string `json:"maxLifetime"`
++	// Claims are copied from the actor's "authorization" object.
++	Claims []string `json:"claims"`
++}
++
++// Exchanger verifies actor tokens and issues output tokens.
++type Exchanger struct {
++	clients   []string
++	connector string
++	actors    []actor
++	outputs   map[string]output
++	Now       func() time.Time
++}
++
++type actor struct {
++	issuer, audience string
++	keys             map[string]ed25519.PublicKey
++}
++
++type output struct {
++	audience, issuer, keyID string
++	key                     ed25519.PrivateKey
++	ttl                     time.Duration
++	claims                  []string
++}
++
++// ErrDenied: the exchange is refused. The reason is logged, never returned
++// to the client.
++var ErrDenied = errors.New("workload token exchange denied")
++
++var (
++	identifier = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
++	claimName  = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
++	// Claims an issued token always sets itself.
++	reserved = []string{"iss", "sub", "aud", "exp", "nbf", "iat", "jti", "act", "azp", "client_id", "scope"}
++)
++
++// New validates c and loads its output keys.
++func New(c Config) (*Exchanger, error) {
++	keys := map[string]ed25519.PrivateKey{}
++	for _, o := range c.Outputs {
++		k, err := loadKey(o.SigningKeyFile)
++		if err != nil {
++			return nil, fmt.Errorf("workloadTokenExchange.outputs[%s].signingKeyFile: %v", o.Audience, err)
++		}
++		keys[o.Audience] = k
++	}
++	return NewWithKeys(c, keys)
++}
++
++// NewWithKeys is New with the output keys given by audience (their files are
++// not read).
++func NewWithKeys(c Config, keys map[string]ed25519.PrivateKey) (*Exchanger, error) {
++	e := &Exchanger{clients: c.Clients, connector: c.SubjectConnector, outputs: map[string]output{}, Now: time.Now}
++	if len(c.Clients) == 0 || slices.ContainsFunc(c.Clients, func(s string) bool { return !identifier.MatchString(s) }) {
++		return nil, errors.New("workloadTokenExchange.clients must name client ids")
++	}
++	if !identifier.MatchString(c.SubjectConnector) {
++		return nil, errors.New("workloadTokenExchange.subjectConnector is required")
++	}
++	if len(c.Actors) == 0 {
++		return nil, errors.New("workloadTokenExchange.actors is empty")
++	}
++	for _, a := range c.Actors {
++		if a.Issuer == "" || a.Audience == "" || len(a.Keys) == 0 {
++			return nil, fmt.Errorf("workloadTokenExchange.actors[%s] needs an issuer, an audience and keys", a.Issuer)
++		}
++		if slices.ContainsFunc(e.actors, func(x actor) bool { return x.issuer == a.Issuer }) {
++			return nil, fmt.Errorf("workloadTokenExchange.actors: issuer %q twice", a.Issuer)
++		}
++		ac := actor{issuer: a.Issuer, audience: a.Audience, keys: map[string]ed25519.PublicKey{}}
++		for _, k := range a.Keys {
++			raw, err := base64.RawURLEncoding.DecodeString(k.Ed25519)
++			if err != nil || len(raw) != ed25519.PublicKeySize || !identifier.MatchString(k.KeyID) {
++				return nil, fmt.Errorf("workloadTokenExchange.actors[%s]: kid %q needs a base64url 32-byte Ed25519 key", a.Issuer, k.KeyID)
++			}
++			if _, dup := ac.keys[k.KeyID]; dup {
++				return nil, fmt.Errorf("workloadTokenExchange.actors[%s]: kid %q twice", a.Issuer, k.KeyID)
++			}
++			ac.keys[k.KeyID] = raw
++		}
++		e.actors = append(e.actors, ac)
++	}
++	if len(c.Outputs) == 0 {
++		return nil, errors.New("workloadTokenExchange.outputs is empty")
++	}
++	for _, o := range c.Outputs {
++		if o.Audience == "" || !identifier.MatchString(o.KeyID) {
++			return nil, fmt.Errorf("workloadTokenExchange.outputs[%s] needs an audience and a keyID", o.Audience)
++		}
++		if _, dup := e.outputs[o.Audience]; dup {
++			return nil, fmt.Errorf("workloadTokenExchange.outputs: audience %q twice", o.Audience)
++		}
++		if u, err := url.Parse(o.Issuer); err != nil || u.Scheme != "https" || u.Host == "" {
++			return nil, fmt.Errorf("workloadTokenExchange.outputs[%s].issuer must be an https URL", o.Audience)
++		}
++		ttl, err := time.ParseDuration(o.MaxLifetime)
++		if err != nil || ttl <= 0 || ttl > time.Hour {
++			return nil, fmt.Errorf("workloadTokenExchange.outputs[%s].maxLifetime must be positive and at most 1h", o.Audience)
++		}
++		for _, n := range o.Claims {
++			if !claimName.MatchString(n) || slices.Contains(reserved, n) {
++				return nil, fmt.Errorf("workloadTokenExchange.outputs[%s].claims: %q cannot be copied", o.Audience, n)
++			}
++		}
++		key := keys[o.Audience]
++		if len(key) != ed25519.PrivateKeySize {
++			return nil, fmt.Errorf("workloadTokenExchange.outputs[%s]: an Ed25519 signing key is required", o.Audience)
++		}
++		e.outputs[o.Audience] = output{audience: o.Audience, issuer: o.Issuer, keyID: o.KeyID, key: key, ttl: ttl, claims: o.Claims}
++	}
++	return e, nil
++}
++
++func loadKey(file string) (ed25519.PrivateKey, error) {
++	raw, err := os.ReadFile(file)
++	if err != nil {
++		return nil, err
++	}
++	block, _ := pem.Decode(raw)
++	if block == nil || block.Type != "PRIVATE KEY" {
++		return nil, errors.New("not a PEM PRIVATE KEY")
++	}
++	k, err := x509.ParsePKCS8PrivateKey(block.Bytes)
++	key, ok := k.(ed25519.PrivateKey)
++	if err != nil || !ok {
++		return nil, errors.New("not an Ed25519 key")
++	}
++	return key, nil
++}
++
++// Client reports whether clientID may exchange.
++func (e *Exchanger) Client(clientID string) bool { return slices.Contains(e.clients, clientID) }
++
++// Connector is the connector that verifies subject tokens.
++func (e *Exchanger) Connector() string { return e.connector }
++
++// Issued is an issued token.
++type Issued struct {
++	Token    string
++	Expiry   time.Time
++	Audience string
++	Actor    string
++}
++
++// Exchange verifies actorToken for subjectToken (already verified by the
++// connector, whose identity is subject) and issues a token for audience.
++func (e *Exchanger) Exchange(subjectToken, subject, actorToken, audience string) (Issued, error) {
++	out, ok := e.outputs[audience]
++	if !ok {
++		return Issued{}, fmt.Errorf("%w: audience %q is not a configured output", ErrDenied, audience)
++	}
++	if subject == "" {
++		return Issued{}, fmt.Errorf("%w: the subject has no identity", ErrDenied)
++	}
++	now := e.Now().UTC()
++	claims, iss, err := e.verifyActor(actorToken, now)
++	if err != nil {
++		return Issued{}, err
++	}
++	sum := sha256.Sum256([]byte(subjectToken))
++	want := base64.RawURLEncoding.EncodeToString(sum[:])
++	got, _ := claims[ClaimSubjectTokenHash].(string)
++	if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
++		return Issued{}, fmt.Errorf("%w: the actor token is not bound to this subject token", ErrDenied)
++	}
++	if t, _ := claims[ClaimTargetAudience].(string); t != audience {
++		return Issued{}, fmt.Errorf("%w: the actor token is for audience %q, not %q", ErrDenied, t, audience)
++	}
++	ttl := out.ttl
++	if v, present := claims[ClaimTokenLifetime]; present {
++		n, ok := v.(float64)
++		if !ok || n < 1 || n != float64(int64(n)) {
++			return Issued{}, fmt.Errorf("%w: %s must be a positive number of seconds", ErrDenied, ClaimTokenLifetime)
++		}
++		if d := time.Duration(n) * time.Second; d < ttl {
++			ttl = d
++		}
++	}
++	authz, _ := claims[ClaimAuthorization].(map[string]any)
++	if authz == nil {
++		return Issued{}, fmt.Errorf("%w: the actor token has no %s object", ErrDenied, ClaimAuthorization)
++	}
++	now = now.Truncate(time.Second)
++	exp := now.Add(ttl)
++	jti := make([]byte, 16)
++	if _, err := rand.Read(jti); err != nil {
++		return Issued{}, err
++	}
++	c := map[string]any{"iss": out.issuer, "sub": subject, "aud": out.audience,
++		"iat": now.Unix(), "nbf": now.Unix(), "exp": exp.Unix(), "jti": hex.EncodeToString(jti)}
++	for _, n := range out.claims {
++		if v, ok := authz[n]; ok {
++			c[n] = v
++		}
++	}
++	token, err := sign(out.key, out.keyID, c)
++	if err != nil {
++		return Issued{}, err
++	}
++	return Issued{Token: token, Expiry: exp, Audience: audience, Actor: iss}, nil
++}
++
++// verifyActor verifies an actor token's signature, issuer, audience and
++// lifetime, and returns its claims and issuer.
++func (e *Exchanger) verifyActor(token string, now time.Time) (map[string]any, string, error) {
++	parts := strings.Split(token, ".")
++	if len(parts) != 3 {
++		return nil, "", fmt.Errorf("%w: the actor token is not a JWS", ErrDenied)
++	}
++	var header struct {
++		Alg  string `json:"alg"`
++		Kid  string `json:"kid"`
++		Crit any    `json:"crit"`
++	}
++	if err := decode(parts[0], &header); err != nil || header.Alg != "EdDSA" || header.Crit != nil {
++		return nil, "", fmt.Errorf("%w: the actor token is not an EdDSA JWS", ErrDenied)
++	}
++	var claims map[string]any
++	if err := decode(parts[1], &claims); err != nil {
++		return nil, "", fmt.Errorf("%w: the actor token claims: %v", ErrDenied, err)
++	}
++	iss, _ := claims["iss"].(string)
++	i := slices.IndexFunc(e.actors, func(a actor) bool { return a.issuer == iss })
++	if i < 0 {
++		return nil, "", fmt.Errorf("%w: actor issuer %q is not trusted", ErrDenied, iss)
++	}
++	a := e.actors[i]
++	key, ok := a.keys[header.Kid]
++	if !ok {
++		return nil, "", fmt.Errorf("%w: actor %s has no key %q", ErrDenied, iss, header.Kid)
++	}
++	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
++	if err != nil || !ed25519.Verify(key, []byte(parts[0]+"."+parts[1]), sig) {
++		return nil, "", fmt.Errorf("%w: the actor token signature is not valid", ErrDenied)
++	}
++	if !audienceContains(claims["aud"], a.audience) {
++		return nil, "", fmt.Errorf("%w: the actor token is not for audience %q", ErrDenied, a.audience)
++	}
++	exp, okExp := unix(claims["exp"])
++	iat, okIat := unix(claims["iat"])
++	switch {
++	case !okExp || !okIat:
++		return nil, "", fmt.Errorf("%w: the actor token needs exp and iat", ErrDenied)
++	case !now.Before(exp):
++		return nil, "", fmt.Errorf("%w: the actor token expired", ErrDenied)
++	case iat.After(now.Add(clockSkew)):
++		return nil, "", fmt.Errorf("%w: the actor token is issued in the future", ErrDenied)
++	case exp.Sub(iat) > maxActorLifetime:
++		return nil, "", fmt.Errorf("%w: the actor token lives longer than %s", ErrDenied, maxActorLifetime)
++	}
++	if nbf, ok := unix(claims["nbf"]); ok && nbf.After(now.Add(clockSkew)) {
++		return nil, "", fmt.Errorf("%w: the actor token is not valid yet", ErrDenied)
++	}
++	return claims, iss, nil
++}
++
++func audienceContains(aud any, want string) bool {
++	switch v := aud.(type) {
++	case string:
++		return v == want
++	case []any:
++		return slices.ContainsFunc(v, func(x any) bool { s, _ := x.(string); return s == want })
++	}
++	return false
++}
++
++func unix(v any) (time.Time, bool) {
++	n, ok := v.(float64)
++	if !ok || n <= 0 {
++		return time.Time{}, false
++	}
++	return time.Unix(int64(n), 0), true
++}
++
++func decode(part string, v any) error {
++	raw, err := base64.RawURLEncoding.DecodeString(part)
++	if err != nil {
++		return err
++	}
++	return json.Unmarshal(raw, v)
++}
++
++func sign(key ed25519.PrivateKey, kid string, claims map[string]any) (string, error) {
++	header, _ := json.Marshal(map[string]string{"alg": "EdDSA", "typ": "JWT", "kid": kid})
++	body, err := json.Marshal(claims)
++	if err != nil {
++		return "", err
++	}
++	in := base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(body)
++	return in + "." + base64.RawURLEncoding.EncodeToString(ed25519.Sign(key, []byte(in))), nil
++}
+diff --git a/server/workload/workload_test.go b/server/workload/workload_test.go
+new file mode 100644
+index 0000000..ced3f96
+--- /dev/null
++++ b/server/workload/workload_test.go
+@@ -0,0 +1,67 @@
++package workload
++
++import (
++	"crypto/ed25519"
++	"crypto/rand"
++	"encoding/base64"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func validConfig(pub ed25519.PublicKey) Config {
++	return Config{
++		Clients:          []string{"pathops-tenant-control-plane"},
++		SubjectConnector: "k8s-cell",
++		Actors: []ActorConfig{{Issuer: "pathops-tenant-control-plane", Audience: "pathops-workload-exchange",
++			Keys: []KeyConfig{{KeyID: "tcp-workload-1", Ed25519: base64.RawURLEncoding.EncodeToString(pub)}}}},
++		Outputs: []OutputConfig{{Audience: "pathops-registry", Issuer: "https://dex.example.org/registry", KeyID: "registry-1",
++			MaxLifetime: "30m", Claims: []string{"access"}}},
++	}
++}
++
++func TestNewValidatesConfig(t *testing.T) {
++	pub, _, _ := ed25519.GenerateKey(rand.Reader)
++	_, out, _ := ed25519.GenerateKey(rand.Reader)
++	keys := map[string]ed25519.PrivateKey{"pathops-registry": out}
++	_, err := NewWithKeys(validConfig(pub), keys)
++	require.NoError(t, err)
++
++	for name, mutate := range map[string]func(*Config){
++		"no clients":           func(c *Config) { c.Clients = nil },
++		"no connector":         func(c *Config) { c.SubjectConnector = "" },
++		"no actors":            func(c *Config) { c.Actors = nil },
++		"bad actor key":        func(c *Config) { c.Actors[0].Keys[0].Ed25519 = "short" },
++		"actor without aud":    func(c *Config) { c.Actors[0].Audience = "" },
++		"no outputs":           func(c *Config) { c.Outputs = nil },
++		"http output issuer":   func(c *Config) { c.Outputs[0].Issuer = "http://dex.example.org/registry" },
++		"lifetime above 1h":    func(c *Config) { c.Outputs[0].MaxLifetime = "2h" },
++		"no lifetime":          func(c *Config) { c.Outputs[0].MaxLifetime = "" },
++		"reserved claim":       func(c *Config) { c.Outputs[0].Claims = []string{"sub"} },
++		"bad claim name":       func(c *Config) { c.Outputs[0].Claims = []string{"Access-Claim"} },
++		"output without a key": func(c *Config) { c.Outputs[0].Audience = "other" },
++	} {
++		t.Run(name, func(t *testing.T) {
++			c := validConfig(pub)
++			mutate(&c)
++			_, err := NewWithKeys(c, keys)
++			require.Error(t, err)
++		})
++	}
++}
++
++func TestExchangeRefusesMalformedActorTokens(t *testing.T) {
++	pub, _, _ := ed25519.GenerateKey(rand.Reader)
++	_, out, _ := ed25519.GenerateKey(rand.Reader)
++	e, err := NewWithKeys(validConfig(pub), map[string]ed25519.PrivateKey{"pathops-registry": out})
++	require.NoError(t, err)
++	none := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`)) + "." +
++		base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"pathops-tenant-control-plane"}`)) + "."
++	for _, tok := range []string{"", "a.b", "a.b.c", none, strings.Repeat("x.", 2) + "y"} {
++		_, err := e.Exchange("subject", "system:serviceaccount:a:b", tok, "pathops-registry")
++		require.ErrorIs(t, err, ErrDenied, tok)
++	}
++	_, err = e.Exchange("subject", "", none, "pathops-registry")
++	require.ErrorIs(t, err, ErrDenied)
++}
+-- 
+2.53.0
+
