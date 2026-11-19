@@ -1,4 +1,4 @@
-From 3fd1cbb0f5caaa6958027481b8b389bc89090fee Mon Sep 17 00:00:00 2001
+From 6710e556e2fd1e97c747c796a080fa302c9041ce Mon Sep 17 00:00:00 2001
 From: PathOps <noreply@pathops.dev>
 Date: Wed, 18 Nov 2026 18:06:03 -0300
 Subject: [PATCH 6/6] workload: generic workload token exchange
@@ -28,7 +28,8 @@ object. Each output is its own signing authority: two outputs
 never share a signing key or an issuer, so a service that verifies only
 the signature (not aud or iss) cannot accept another output's token. Dex does not interpret those claims; the actor already decided
 them. A token exchange with an actor_token is answered only by this grant
-(unsupported when it is not configured).
+(unsupported when it is not configured). Toward the subject connector it is a token
+exchange: a connector limited to grantTypes [token-exchange] serves it.
 
 Configuration (opt-in; without it nothing changes):
 
@@ -50,14 +51,14 @@ Configuration (opt-in; without it nothing changes):
  cmd/dex/config.go                    |   5 +
  cmd/dex/serve.go                     |  15 +
  server/config.go                     |   5 +
- server/grants/grants.go              |  17 ++
- server/grants/workload.go            |  93 +++++++
+ server/grants/grants.go              |  25 +-
+ server/grants/workload.go            |  98 +++++++
  server/grants/workload_test.go       | 271 ++++++++++++++++++
  server/server.go                     |   1 +
- server/server_grant_workload_test.go |  79 ++++++
+ server/server_grant_workload_test.go |  94 +++++++
  server/workload/workload.go          | 400 +++++++++++++++++++++++++++
  server/workload/workload_test.go     |  88 ++++++
- 10 files changed, 974 insertions(+)
+ 10 files changed, 1001 insertions(+), 1 deletion(-)
  create mode 100644 server/grants/workload.go
  create mode 100644 server/grants/workload_test.go
  create mode 100644 server/server_grant_workload_test.go
@@ -144,7 +145,7 @@ index bd9174b..6ec3060 100644
  	AlwaysShowLoginScreen bool
  
 diff --git a/server/grants/grants.go b/server/grants/grants.go
-index 1259e05..fedbe67 100644
+index 1259e05..f745037 100644
 --- a/server/grants/grants.go
 +++ b/server/grants/grants.go
 @@ -20,6 +20,7 @@ import (
@@ -206,12 +207,27 @@ index 1259e05..fedbe67 100644
  	}
  	if !h.dispatch(w, r, grantType) {
  		h.Logger.ErrorContext(ctx, "unsupported grant type", "grant_type", grantType)
+@@ -271,7 +288,13 @@ func (h *Handler) dispatch(w http.ResponseWriter, r *http.Request, grantType str
+ 		h.writeError(ctx, w, oerr)
+ 		return true
+ 	}
+-	conn, oerr := h.resolveConnector(ctx, connID, client, grant.GrantType())
++	// A connector's grantTypes name OAuth grant types: a grant registered
++	// under an internal key says which one it is toward the connector.
++	connGrant := grant.GrantType()
++	if g, ok := grant.(interface{ ConnectorGrantType() string }); ok {
++		connGrant = g.ConnectorGrantType()
++	}
++	conn, oerr := h.resolveConnector(ctx, connID, client, connGrant)
+ 	if oerr != nil {
+ 		h.writeError(ctx, w, oerr)
+ 		return true
 diff --git a/server/grants/workload.go b/server/grants/workload.go
 new file mode 100644
-index 0000000..6abc03c
+index 0000000..702d2a1
 --- /dev/null
 +++ b/server/grants/workload.go
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,98 @@
 +package grants
 +
 +import (
@@ -242,6 +258,11 @@ index 0000000..6abc03c
 +}
 +
 +func (g *workloadExchange) GrantType() string { return workloadGrantType }
++
++// ConnectorGrantType: toward the subject connector the workload exchange is
++// an RFC 8693 token exchange, so a connector limited to it (grantTypes:
++// [urn:ietf:params:oauth:grant-type:token-exchange]) serves it.
++func (g *workloadExchange) ConnectorGrantType() string { return oauth2.GrantTypeTokenExchange }
 +
 +func (g *workloadExchange) RequiresClientAuth() bool { return true }
 +
@@ -596,10 +617,10 @@ index 4985756..b4ab731 100644
  			Issuer: s.issuerURL.String(),
 diff --git a/server/server_grant_workload_test.go b/server/server_grant_workload_test.go
 new file mode 100644
-index 0000000..a6b5fb5
+index 0000000..56f4327
 --- /dev/null
 +++ b/server/server_grant_workload_test.go
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,94 @@
 +package server
 +
 +import (
@@ -648,7 +669,7 @@ index 0000000..a6b5fb5
 +	in := base64.RawURLEncoding.EncodeToString(h) + "." + base64.RawURLEncoding.EncodeToString(b)
 +	actor := in + "." + base64.RawURLEncoding.EncodeToString(ed25519.Sign(priv, []byte(in)))
 +
-+	post := func(t *testing.T, enabled bool, client, secret string) *httptest.ResponseRecorder {
++	post := func(t *testing.T, enabled bool, client, secret string, grantTypes ...string) *httptest.ResponseRecorder {
 +		httpServer, s := newTestServer(t, func(c *Config) {
 +			if enabled {
 +				c.Workload = ex
@@ -657,6 +678,13 @@ index 0000000..a6b5fb5
 +			c.Storage.CreateClient(t.Context(), storage.Client{ID: "other", Secret: "secret"})
 +		})
 +		defer httpServer.Close()
++		if grantTypes != nil {
++			require.NoError(t, s.storage.UpdateConnector(t.Context(), "mock", func(c storage.Connector) (storage.Connector, error) {
++				c.GrantTypes = grantTypes
++				return c, nil
++			}))
++			s.connectors.Close("mock")
++		}
 +		vals := url.Values{"grant_type": {oauth2.GrantTypeTokenExchange}, "subject_token": {subject},
 +			"subject_token_type": {oauth2.TokenTypeID}, "actor_token": {actor}, "actor_token_type": {workload.ActorTokenType},
 +			"audience": {"pathops-registry"}, "client_id": {client}, "client_secret": {secret}}
@@ -672,6 +700,14 @@ index 0000000..a6b5fb5
 +	var res tokens.Response
 +	require.NoError(t, json.NewDecoder(rr.Body).Decode(&res))
 +	require.Equal(t, workload.IssuedTokenType, res.IssuedTokenType)
++
++	// A subject connector limited to token exchange (as a Cell's k8s-cell
++	// connector is) serves the workload exchange; one that does not allow
++	// token exchange does not.
++	rr = post(t, true, "tcp", "secret", oauth2.GrantTypeTokenExchange)
++	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
++	rr = post(t, true, "tcp", "secret", oauth2.GrantTypeAuthorizationCode)
++	require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
 +
 +	require.Equal(t, http.StatusUnauthorized, post(t, true, "tcp", "wrong").Code)
 +	require.Equal(t, http.StatusBadRequest, post(t, true, "other", "secret").Code)
