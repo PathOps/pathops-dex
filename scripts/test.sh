@@ -53,9 +53,9 @@ grep -q -- "--- PASS: TestDelegationTemplateBuildAndPush " <<< "$out" \
 
 echo "test: PathOps generic workload token exchange tests"
 out=$(go test ./server/ ./server/workload/ ./server/grants/ -count=1 \
-  -run 'Workload|TestNewValidatesConfig|TestExchangeRefusesMalformedActorTokens' -v)
+  -run 'Workload|TestNew|TestExchangeRefusesMalformedActorTokens' -v)
 echo "$out" | grep -E -- '^--- (PASS|FAIL)'
-for t in TestNewValidatesConfig TestExchangeRefusesMalformedActorTokens TestWorkloadExchange \
+for t in TestNewValidatesConfig TestNewRefusesSharedOutputAuthority TestExchangeRefusesMalformedActorTokens TestWorkloadExchange \
   TestWorkloadPackageHasNoKubernetesAPI TestHandleWorkloadTokenExchange; do
   grep -q -- "--- PASS: $t " <<< "$out" || { echo "test: $t did not run and pass" >&2; exit 1; }
 done

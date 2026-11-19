@@ -1,4 +1,4 @@
-From 3290d8daec64d2629affa85ad2337bcf75495f2f Mon Sep 17 00:00:00 2001
+From 3fd1cbb0f5caaa6958027481b8b389bc89090fee Mon Sep 17 00:00:00 2001
 From: PathOps <noreply@pathops.dev>
 Date: Wed, 18 Nov 2026 18:06:03 -0300
 Subject: [PATCH 6/6] workload: generic workload token exchange
@@ -24,7 +24,9 @@ for a JWT signed with the output's own Ed25519 key, with the output's
 issuer and audience, the subject's identity as sub, at most the output's
 maxLifetime (less when the actor's token_lifetime asks for less), and the
 claims the output lists copied unchanged from the actor's authorization
-object. Dex does not interpret those claims; the actor already decided
+object. Each output is its own signing authority: two outputs
+never share a signing key or an issuer, so a service that verifies only
+the signature (not aud or iss) cannot accept another output's token. Dex does not interpret those claims; the actor already decided
 them. A token exchange with an actor_token is answered only by this grant
 (unsupported when it is not configured).
 
@@ -53,9 +55,9 @@ Configuration (opt-in; without it nothing changes):
  server/grants/workload_test.go       | 271 ++++++++++++++++++
  server/server.go                     |   1 +
  server/server_grant_workload_test.go |  79 ++++++
- server/workload/workload.go          | 392 +++++++++++++++++++++++++++
- server/workload/workload_test.go     |  67 +++++
- 10 files changed, 945 insertions(+)
+ server/workload/workload.go          | 400 +++++++++++++++++++++++++++
+ server/workload/workload_test.go     |  88 ++++++
+ 10 files changed, 974 insertions(+)
  create mode 100644 server/grants/workload.go
  create mode 100644 server/grants/workload_test.go
  create mode 100644 server/server_grant_workload_test.go
@@ -679,10 +681,10 @@ index 0000000..a6b5fb5
 +}
 diff --git a/server/workload/workload.go b/server/workload/workload.go
 new file mode 100644
-index 0000000..bb5faf0
+index 0000000..edbcdb3
 --- /dev/null
 +++ b/server/workload/workload.go
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,400 @@
 +// Package workload is the PathOps generic workload token exchange (PathOps
 +// Decision 0065): an RFC 8693 token exchange with both a subject token and
 +// an actor token, for a short-lived token of a configured output audience.
@@ -892,6 +894,14 @@ index 0000000..bb5faf0
 +		if len(key) != ed25519.PrivateKeySize {
 +			return nil, fmt.Errorf("workloadTokenExchange.outputs[%s]: an Ed25519 signing key is required", o.Audience)
 +		}
++		// Each output is its own signing authority: a service that verifies
++		// only the signature (and not aud or iss) still cannot accept a
++		// token Dex issued for another output.
++		for _, other := range e.outputs {
++			if other.key.Equal(key) || other.issuer == o.Issuer {
++				return nil, fmt.Errorf("workloadTokenExchange.outputs[%s] shares its signing key or issuer with outputs[%s]", o.Audience, other.audience)
++			}
++		}
 +		e.outputs[o.Audience] = output{audience: o.Audience, issuer: o.Issuer, keyID: o.KeyID, key: key, ttl: ttl, claims: o.Claims}
 +	}
 +	return e, nil
@@ -1077,10 +1087,10 @@ index 0000000..bb5faf0
 +}
 diff --git a/server/workload/workload_test.go b/server/workload/workload_test.go
 new file mode 100644
-index 0000000..ced3f96
+index 0000000..d0622e0
 --- /dev/null
 +++ b/server/workload/workload_test.go
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,88 @@
 +package workload
 +
 +import (
@@ -1132,6 +1142,27 @@ index 0000000..ced3f96
 +			require.Error(t, err)
 +		})
 +	}
++}
++
++// Two outputs never share a signing key or an issuer: a service that checks
++// only the signature cannot accept another output's token.
++func TestNewRefusesSharedOutputAuthority(t *testing.T) {
++	pub, _, _ := ed25519.GenerateKey(rand.Reader)
++	_, registry, _ := ed25519.GenerateKey(rand.Reader)
++	_, artifacts, _ := ed25519.GenerateKey(rand.Reader)
++	second := OutputConfig{Audience: "pathops-artifact-store", Issuer: "https://dex.example.org/artifacts", KeyID: "artifact-1",
++		MaxLifetime: "5m", Claims: []string{"pathops_application"}}
++	c := validConfig(pub)
++	c.Outputs = append(c.Outputs, second)
++	_, err := NewWithKeys(c, map[string]ed25519.PrivateKey{"pathops-registry": registry, "pathops-artifact-store": artifacts})
++	require.NoError(t, err)
++
++	_, err = NewWithKeys(c, map[string]ed25519.PrivateKey{"pathops-registry": registry, "pathops-artifact-store": registry})
++	require.ErrorContains(t, err, "shares its signing key or issuer")
++
++	c.Outputs[1].Issuer = c.Outputs[0].Issuer
++	_, err = NewWithKeys(c, map[string]ed25519.PrivateKey{"pathops-registry": registry, "pathops-artifact-store": artifacts})
++	require.ErrorContains(t, err, "shares its signing key or issuer")
 +}
 +
 +func TestExchangeRefusesMalformedActorTokens(t *testing.T) {

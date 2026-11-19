@@ -225,6 +225,10 @@ curl -u pathops-tenant-control-plane:<secret> \
   `maxLifetime`), `jti`, and each claim listed in `claims` copied unchanged
   from the actor's `authorization` object. Nothing else of the actor is
   copied, and `iss`, `sub`, `aud`, `exp`, `nbf`, `iat`, `jti` cannot be.
+- Each output is its own signing authority: two outputs never share a
+  signing key or an issuer (Dex refuses such a configuration). A service that
+  verifies only the signature and not `aud`/`iss` (zot's `bearer.cert`) can
+  therefore not accept a token issued for another output.
 - Dex does not interpret `authorization`, reads no Kubernetes object and
   knows no naming convention: the actor decides what a workload may do; Dex
   proves who decided it, that it belongs to exactly this subject token, that
