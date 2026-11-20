@@ -1,4 +1,4 @@
-From 62f22bf64e6785ca0ff0d7439aaf0d2e2f574342 Mon Sep 17 00:00:00 2001
+From 7c195793395d4938d84021f9c23eaff4f519664e Mon Sep 17 00:00:00 2001
 From: PathOps <noreply@pathops.dev>
 Date: Fri, 6 Nov 2026 03:56:00 -0300
 Subject: [PATCH] delegation: operation-scoped delegated authorization (PAR,
@@ -60,9 +60,10 @@ Without the configuration, behavior is unchanged.
  server/delegation/delegation.go       | 338 ++++++++++++
  server/delegation/delegation_test.go  | 104 ++++
  server/delegation/derive.go           |  84 +++
+ server/delegation/details_test.go     |  28 +
  server/delegation/flow.go             |  40 ++
  server/delegation/grant.go            | 223 ++++++++
- server/delegation/plan.go             | 469 +++++++++++++++++
+ server/delegation/plan.go             | 472 +++++++++++++++++
  server/discovery/discovery.go         |  11 +
  server/grants/authcode.go             |  43 ++
  server/grants/delegation.go           |  76 +++
@@ -81,13 +82,14 @@ Without the configuration, behavior is unchanged.
  storage/kubernetes/types.go           |  12 +-
  storage/storage.go                    |   9 +
  web/templates/delegation.html         | 159 ++++++
- 36 files changed, 3089 insertions(+), 7 deletions(-)
+ 37 files changed, 3120 insertions(+), 7 deletions(-)
  create mode 100644 server/authflow/par.go
  create mode 100644 server/delegation/authorization.go
  create mode 100644 server/delegation/canonical.go
  create mode 100644 server/delegation/delegation.go
  create mode 100644 server/delegation/delegation_test.go
  create mode 100644 server/delegation/derive.go
+ create mode 100644 server/delegation/details_test.go
  create mode 100644 server/delegation/flow.go
  create mode 100644 server/delegation/grant.go
  create mode 100644 server/delegation/plan.go
@@ -1502,6 +1504,40 @@ index 0000000..aab48ea
 +	}
 +	return &Derived{Token: tok, Expiry: exp, Audience: audience, Details: sub}, nil
 +}
+diff --git a/server/delegation/details_test.go b/server/delegation/details_test.go
+new file mode 100644
+index 0000000..5c9e93f
+--- /dev/null
++++ b/server/delegation/details_test.go
+@@ -0,0 +1,28 @@
++package delegation
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++// A plan has 1 to maxDetails distinct details.
++func TestCheckDetailsCount(t *testing.T) {
++	p, err := NewPolicy(validConfig())
++	require.NoError(t, err)
++	d := p.delegates["pathops-tenant-control-plane"]
++	aud := map[string]string{"forgejo": "u:1:00000000-0000-4000-8000-000000000000"}
++	details := func(n int) []byte {
++		els := make([]string, n)
++		for i := range els {
++			els[i] = `{"actions":["create"],"repository":"r` + strings.Repeat("x", i) + `","tool":"forgejo","type":"pathops_repository"}`
++		}
++		return []byte("[" + strings.Join(els, ",") + "]")
++	}
++	require.NoError(t, d.checkDetails(details(1), aud))
++	require.NoError(t, d.checkDetails(details(maxDetails), aud))
++	require.Error(t, d.checkDetails(details(maxDetails+1), aud))
++	require.Error(t, d.checkDetails([]byte("[]"), aud))
++	require.Equal(t, 64, maxDetails)
++}
 diff --git a/server/delegation/flow.go b/server/delegation/flow.go
 new file mode 100644
 index 0000000..d7ba6e0
@@ -1779,10 +1815,10 @@ index 0000000..850437b
 +}
 diff --git a/server/delegation/plan.go b/server/delegation/plan.go
 new file mode 100644
-index 0000000..b560be1
+index 0000000..9bf5442
 --- /dev/null
 +++ b/server/delegation/plan.go
-@@ -0,0 +1,469 @@
+@@ -0,0 +1,472 @@
 +package delegation
 +
 +import (
@@ -2020,7 +2056,10 @@ index 0000000..b560be1
 +	Actions []string `json:"actions"`
 +}
 +
-+const maxDetails = 32
++// maxDetails bounds one plan's details: an Application's create-app plan
++// names every object its provisioning creates (PathOps Decision 0064's
++// BUILD and Preflight capabilities use about 50).
++const maxDetails = 64
 +
 +// elements splits a canonical JSON array into its canonical elements.
 +func elements(canonical []byte) ([]json.RawMessage, error) {
