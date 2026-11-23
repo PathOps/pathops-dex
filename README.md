@@ -29,6 +29,10 @@ Current patch set:
   RFC 8693 exchange of a workload subject token and a bound, signed actor
   token for a short-lived token of a configured service audience. See
   [Workload token exchange](#workload-token-exchange).
+- `0007`: the consent screen describes PathOps Routes (Decision 0067): each
+  `pathops_route` detail with its hostname per Environment, the operation
+  title of `CREATE_ROUTES`, and a Kubernetes object detail's `update` action
+  with the exact `allowedHosts` it writes.
 
 Long-term goal: remove the functional patch once equivalent functionality is
 available upstream, and consume official Dex images again.

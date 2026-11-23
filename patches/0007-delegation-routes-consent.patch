@@ -1,0 +1,230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: PathOps <noreply@pathops.dev>
+Date: Mon, 23 Nov 2026 01:23:21 -0300
+Subject: [PATCH 7/7] delegation: show PathOps Routes and the Routes parameter
+ update on the consent screen
+
+PathOps Decision 0067 adds Application Routes to the create-app plan and
+a CREATE_ROUTES operation. A pathops_route detail (tool "pathops") names
+a Route, whether it is the Application's default and its hostname in
+each Environment, with the action reserve. The Routes parameter of an
+Application's Preflight (ConfigMap pathops-routes) is a Kubernetes
+object detail that may also carry the action update and its exact
+allowedHosts. The consent screen shows each Route with its hostnames,
+and the object's allowed hostnames, instead of other resources.
+---
+ server/consent/consent.go            |  1 +
+ server/delegation/delegation_test.go | 20 ++++++++++++
+ server/delegation/plan.go            | 46 +++++++++++++++++++++++++++-
+ server/templates/templates_test.go   | 31 +++++++++++++++++++
+ web/templates/delegation.html        | 23 ++++++++++++++
+ 5 files changed, 120 insertions(+), 1 deletion(-)
+
+diff --git a/server/consent/consent.go b/server/consent/consent.go
+index 278c08b..bd5fd92 100644
+--- a/server/consent/consent.go
++++ b/server/consent/consent.go
+@@ -252,6 +252,7 @@ func (h *Handler) handleDelegationApproval(w http.ResponseWriter, r *http.Reques
+ // operationTitles name the operations of PathOps plans on the consent screen.
+ var operationTitles = map[string]string{
+ 	"CREATE_APPLICATION": "Create an application",
++	"CREATE_ROUTES":      "Create routes",
+ }
+ 
+ // humanDuration says d in whole hours, minutes or seconds.
+diff --git a/server/delegation/delegation_test.go b/server/delegation/delegation_test.go
+index 2b2084f..cd47902 100644
+--- a/server/delegation/delegation_test.go
++++ b/server/delegation/delegation_test.go
+@@ -132,3 +132,23 @@ func TestConsentBuildAndPush(t *testing.T) {
+ 	}, k8s.KubernetesResources)
+ 	require.Empty(t, k8s.Other)
+ }
++
++// TestConsentRoutes: PathOps Routes (Decision 0067) show their hostnames, and
++// the Routes parameter object its exact allowed hostnames and the update.
++func TestConsentRoutes(t *testing.T) {
++	p, err := NewPolicy(validConfig())
++	require.NoError(t, err)
++	got := p.Consent(&Plan{Delegate: "pathops-tenant-control-plane", Details: []byte(`[
++		{"type":"pathops_route","tool":"pathops","application":"x","name":"api-shop","default":true,
++		 "hosts":{"preflight":"api-shop-preflight-c1.example","production":"api-shop-production-c1.example"},"actions":["reserve"]},
++		{"type":"pathops_kubernetes_resource","tool":"kubernetes","application":"x","apiGroup":"","resource":"configmaps",
++		 "namespace":"a-preflight-deploy","name":"pathops-routes","allowedHosts":["api-shop-preflight-c1.example"],"actions":["update"]}]`)})
++	require.Len(t, got.Tools, 2)
++	require.Equal(t, []ConsentRoute{{Name: "api-shop", Application: "x", Default: true,
++		Hosts:   []ConsentHost{{"preflight", "api-shop-preflight-c1.example"}, {"production", "api-shop-production-c1.example"}},
++		Actions: []ConsentAction{{"reserve", "reserve this name and its hostnames for the application"}}}}, got.Tools[0].Routes)
++	require.Empty(t, got.Tools[0].Other)
++	require.Equal(t, []ConsentKubernetesResource{{Kind: "configmaps", Name: "a-preflight-deploy/pathops-routes", Application: "x",
++		Actions:      []ConsentAction{{"update", "replace this object's content with the content shown"}},
++		AllowedHosts: []string{"api-shop-preflight-c1.example"}}}, got.Tools[1].KubernetesResources)
++}
+diff --git a/server/delegation/plan.go b/server/delegation/plan.go
+index d03f5e3..5c77a34 100644
+--- a/server/delegation/plan.go
++++ b/server/delegation/plan.go
+@@ -360,6 +360,9 @@ type ConsentTool struct {
+ 	RepositoryTokens    []ConsentRepositoryToken
+ 	DeployKeys          []ConsentDeployKey
+ 	KubernetesResources []ConsentKubernetesResource
++	// Routes are the PathOps Routes the operation reserves (Decision
++	// 0067): a name and its hostname in each Environment.
++	Routes []ConsentRoute
+ 	// Other are details of other types, described generically.
+ 	Other []string
+ }
+@@ -386,6 +389,23 @@ type ConsentKubernetesResource struct {
+ 	// namespaced object.
+ 	Kind, Name, Application string
+ 	Actions                 []ConsentAction
++	// AllowedHosts are the hostnames the object admits, when it is a PathOps
++	// Routes parameter (the exact content the operation writes).
++	AllowedHosts []string
++}
++
++// ConsentRoute is one Route detail: an external name reserved for an
++// Application, with its hostname in each Environment.
++type ConsentRoute struct {
++	Name, Application string
++	Default           bool
++	Hosts             []ConsentHost
++	Actions           []ConsentAction
++}
++
++// ConsentHost is a Route's hostname in one Environment.
++type ConsentHost struct {
++	Environment, Host string
+ }
+ 
+ // ConsentRepository is one repository detail.
+@@ -426,6 +446,10 @@ var typeActionMeanings = map[string]map[string]string{
+ 	},
+ 	"pathops_kubernetes_resource": {
+ 		"create": "create this object",
++		"update": "replace this object's content with the content shown",
++	},
++	"pathops_route": {
++		"reserve": "reserve this name and its hostnames for the application",
+ 	},
+ }
+ 
+@@ -507,7 +531,19 @@ func (p *Policy) Consent(pl *Plan) Consent {
+ 				name = ns + "/" + name
+ 			}
+ 			t.KubernetesResources = append(t.KubernetesResources, ConsentKubernetesResource{Kind: kind, Name: name,
+-				Application: str("application"), Actions: typedConsentActions(dt.Type, dt.Actions)})
++				Application: str("application"), Actions: typedConsentActions(dt.Type, dt.Actions),
++				AllowedHosts: optionalList(m["allowedHosts"])})
++		case "pathops_route":
++			isDefault, _ := m["default"].(bool)
++			r := ConsentRoute{Name: str("name"), Application: str("application"), Default: isDefault,
++				Actions: typedConsentActions(dt.Type, dt.Actions)}
++			hosts, _ := m["hosts"].(map[string]any)
++			for _, env := range []string{"preflight", "production"} {
++				if h, ok := hosts[env].(string); ok {
++					r.Hosts = append(r.Hosts, ConsentHost{Environment: env, Host: h})
++				}
++			}
++			t.Routes = append(t.Routes, r)
+ 		default:
+ 			t.Other = append(t.Other, describe(dt, m))
+ 		}
+@@ -531,6 +567,14 @@ func describe(dt detail, m map[string]any) string {
+ 	return strings.Join(parts, " ")
+ }
+ 
++// optionalList is eventList, nil when v is absent.
++func optionalList(v any) []string {
++	if v == nil {
++		return nil
++	}
++	return eventList(v)
++}
++
+ func eventList(v any) []string {
+ 	list, _ := v.([]any)
+ 	s := make([]string, 0, len(list))
+diff --git a/server/templates/templates_test.go b/server/templates/templates_test.go
+index 627f5a5..4030b46 100644
+--- a/server/templates/templates_test.go
++++ b/server/templates/templates_test.go
+@@ -142,3 +142,34 @@ func TestDelegationTemplateBuildAndPush(t *testing.T) {
+ 		t.Error("BUILD_AND_PUSH details are shown as other resources")
+ 	}
+ }
++
++// The bundled consent screen shows Routes with their hostnames and a Routes
++// parameter's allowed hostnames (PathOps Decision 0067).
++func TestDelegationTemplateRoutes(t *testing.T) {
++	_, _, _, tmpls, err := LoadWebConfig(Config{WebFS: os.DirFS("../../web"), Issuer: "dex"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	page := DelegationPage{User: "gaston", Delegate: "PathOps Tenant Control Plane", Consent: delegation.Consent{Tools: []delegation.ConsentTool{
++		{Name: "pathops", DisplayName: "PathOps",
++			Routes: []delegation.ConsentRoute{{Name: "api-shop", Default: true, Hosts: []delegation.ConsentHost{
++				{Environment: "preflight", Host: "api-shop-preflight-c1.example"}, {Environment: "production", Host: "api-shop-production-c1.example"}}}}},
++		{Name: "kubernetes", DisplayName: "Kubernetes",
++			KubernetesResources: []delegation.ConsentKubernetesResource{{Kind: "configmaps", Name: "a-preflight-deploy/pathops-routes",
++				AllowedHosts: []string{"api-shop-preflight-c1.example"}}}},
++	}}}
++	rr := httptest.NewRecorder()
++	if err := tmpls.Delegation(httptest.NewRequest(http.MethodGet, "/approval", nil), rr, page); err != nil {
++		t.Fatal(err)
++	}
++	body := rr.Body.String()
++	for _, want := range []string{"Routes", "api-shop", "default", "api-shop-preflight-c1.example", "api-shop-production-c1.example",
++		"Allowed hostnames", "a-preflight-deploy/pathops-routes"} {
++		if !strings.Contains(body, want) {
++			t.Errorf("the consent screen does not show %q", want)
++		}
++	}
++	if strings.Contains(body, "Other resources") {
++		t.Error("Routes are shown as other resources")
++	}
++}
+diff --git a/web/templates/delegation.html b/web/templates/delegation.html
+index d2776c9..498b6cd 100644
+--- a/web/templates/delegation.html
++++ b/web/templates/delegation.html
+@@ -140,6 +140,25 @@
+       </div>
+       {{ end }}
+ 
++      {{ with .Routes }}
++      <div class="pc-section">
++        <h3>Routes</h3>
++        <ul class="pc-list">
++          {{ range . }}
++          <li class="pc-item">
++            <div class="pc-item-head">
++              <code class="pc-name">{{ .Name }}</code>{{ if .Default }} <span class="pc-chip">default</span>{{ end }}
++              <span class="pc-chips">{{ range .Actions }}<span class="pc-chip" title="{{ .Meaning }}">{{ .Name }}</span>{{ end }}</span>
++            </div>
++            <dl class="pc-facts">
++              {{ range .Hosts }}<dt>{{ .Environment }}</dt><dd><code>{{ .Host }}</code></dd>{{ end }}
++            </dl>
++          </li>
++          {{ end }}
++        </ul>
++      </div>
++      {{ end }}
++
+       {{ with .KubernetesResources }}
+       <div class="pc-section">
+         <h3>Kubernetes objects</h3>
+@@ -151,6 +170,10 @@
+               <span class="pc-chips">{{ range .Actions }}<span class="pc-chip" title="{{ .Meaning }}">{{ .Name }}</span>{{ end }}</span>
+             </div>
+             <p class="pc-note"><code>{{ .Kind }}</code></p>
++            {{ with .AllowedHosts }}
++            <p class="pc-note">Allowed hostnames (the object's whole content):</p>
++            <ul>{{ range . }}<li><code>{{ . }}</code></li>{{ end }}</ul>
++            {{ end }}
+           </li>
+           {{ end }}
+         </ul>
+-- 
+2.53.0
+

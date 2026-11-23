@@ -41,15 +41,17 @@ echo "test: PathOps delegation tests"
 out=$(go test ./server/ ./server/delegation/ ./storage/kubernetes/ -count=1 -run 'Delegation|NewPolicy|AudiencePattern|Consent' -v)
 echo "$out" | grep -E -- '^--- (PASS|FAIL)'
 for t in TestDelegationFlow TestDelegationOperationsAreSeparate TestDelegationPushedRequestChecks TestDelegationConsent TestDelegationSessions \
-  TestDelegationCanonical TestNewPolicy TestConsentGroupsByTool TestConsentBuildAndPush TestDelegationFieldRoundTrip; do
+  TestDelegationCanonical TestNewPolicy TestConsentGroupsByTool TestConsentBuildAndPush TestConsentRoutes TestDelegationFieldRoundTrip; do
   grep -q -- "--- PASS: $t " <<< "$out" || { echo "test: $t did not run and pass" >&2; exit 1; }
 done
 
-echo "test: PathOps BUILD_AND_PUSH consent screen tests"
+echo "test: PathOps BUILD_AND_PUSH and Routes consent screen tests"
 out=$(go test ./server/templates/ -count=1 -run 'TestDelegationTemplate' -v)
 echo "$out" | grep -E -- '^--- (PASS|FAIL)'
 grep -q -- "--- PASS: TestDelegationTemplateBuildAndPush " <<< "$out" \
   || { echo "test: TestDelegationTemplateBuildAndPush did not run and pass" >&2; exit 1; }
+grep -q -- "--- PASS: TestDelegationTemplateRoutes " <<< "$out" \
+  || { echo "test: TestDelegationTemplateRoutes did not run and pass" >&2; exit 1; }
 
 echo "test: PathOps generic workload token exchange tests"
 out=$(go test ./server/ ./server/workload/ ./server/grants/ -count=1 \
