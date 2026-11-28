@@ -101,7 +101,7 @@ delegation:
           url: https://forgejo.example.org                       # canonical URL, shown on the consent screen
           iconURL: https://forgejo.example.org/assets/img/logo.svg  # optional
           audiencePattern: 'u:[0-9]+:[0-9a-f-]{36}'
-          detailTypes: [pathops_repository, pathops_webhook]
+          detailTypes: [pathops_repository, pathops_repository_token, pathops_deploy_key]
 ```
 
 Each tool needs a canonical `url` (https, no credentials, query or

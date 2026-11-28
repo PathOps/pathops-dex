@@ -1,7 +1,7 @@
-From 6710e556e2fd1e97c747c796a080fa302c9041ce Mon Sep 17 00:00:00 2001
+From bced40ad989a56e96db4401e80825409e643f4c0 Mon Sep 17 00:00:00 2001
 From: PathOps <noreply@pathops.dev>
 Date: Wed, 18 Nov 2026 18:06:03 -0300
-Subject: [PATCH 6/6] workload: generic workload token exchange
+Subject: [PATCH] workload: generic workload token exchange
 
 PathOps Decision 0065: one generic RFC 8693 workload token exchange
 replaces the service-specific registry and Artifact Store token profiles.

@@ -1,4 +1,4 @@
-From 967db21b18a21b74904d98db78cbeb3490c44a8b Mon Sep 17 00:00:00 2001
+From 4d4678b1e214d417d40872194dc3f3f8c7ec1211 Mon Sep 17 00:00:00 2001
 From: PathOps <noreply@pathops.dev>
 Date: Fri, 6 Nov 2026 03:56:00 -0300
 Subject: [PATCH] delegation: operation-scoped delegated authorization (PAR,
@@ -19,7 +19,7 @@ delegated authorization (PathOps Decision 0050):
   stored consents and login sessions never bypass; the authenticated user
   must be the plan's subject. It groups the resources by tool, each headed
   by the tool's display name, canonical URL and optional icon from the
-  configuration (never from the plan), lists repositories and webhooks with
+  configuration (never from the plan), lists repositories and other details with
   their actions, the operation, and the exact details as indented JSON;
 - an operation grant stored in the user's UserIdentity (reserved Consents
   key), approved on consent and activated only when the code is redeemed
@@ -58,19 +58,19 @@ Without the configuration, behavior is unchanged.
  server/delegation/authorization.go    | 101 ++++
  server/delegation/canonical.go        | 171 ++++++
  server/delegation/delegation.go       | 338 ++++++++++++
- server/delegation/delegation_test.go  | 104 ++++
+ server/delegation/delegation_test.go  |  99 ++++
  server/delegation/derive.go           |  84 +++
  server/delegation/details_test.go     |  32 ++
  server/delegation/flow.go             |  40 ++
  server/delegation/grant.go            | 223 ++++++++
- server/delegation/plan.go             | 472 +++++++++++++++++
+ server/delegation/plan.go             | 451 ++++++++++++++++
  server/discovery/discovery.go         |  11 +
  server/grants/authcode.go             |  43 ++
  server/grants/delegation.go           |  76 +++
  server/grants/grants.go               |  24 +-
  server/introspection/introspection.go |   5 +
  server/server.go                      |  14 +
- server/server_delegation_test.go      | 729 ++++++++++++++++++++++++++
+ server/server_delegation_test.go      | 728 ++++++++++++++++++++++++++
  server/signer/local.go                |   8 +-
  server/signer/mock.go                 |   4 +
  server/signer/signer.go               |   7 +
@@ -81,8 +81,8 @@ Without the configuration, behavior is unchanged.
  storage/kubernetes/delegation_test.go |  24 +
  storage/kubernetes/types.go           |  12 +-
  storage/storage.go                    |   9 +
- web/templates/delegation.html         | 159 ++++++
- 37 files changed, 3124 insertions(+), 7 deletions(-)
+ web/templates/delegation.html         | 141 +++++
+ 37 files changed, 3079 insertions(+), 7 deletions(-)
  create mode 100644 server/authflow/par.go
  create mode 100644 server/delegation/authorization.go
  create mode 100644 server/delegation/canonical.go
@@ -1306,10 +1306,10 @@ index 0000000..183f788
 +func (p *Policy) TokensValidFor() time.Duration { return p.tokenTTL }
 diff --git a/server/delegation/delegation_test.go b/server/delegation/delegation_test.go
 new file mode 100644
-index 0000000..4d4468e
+index 0000000..02b158f
 --- /dev/null
 +++ b/server/delegation/delegation_test.go
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,99 @@
 +package delegation
 +
 +import (
@@ -1386,13 +1386,11 @@ index 0000000..4d4468e
 +	c := validConfig()
 +	c.Delegates[0].Tools[0].DisplayName = "Forgejo"
 +	c.Delegates[0].Tools[0].IconURL = "https://forgejo-c1.example/assets/img/logo.svg"
-+	c.Delegates[0].Tools[0].DetailTypes = []string{"pathops_repository", "pathops_webhook"}
++	c.Delegates[0].Tools[0].DetailTypes = []string{"pathops_repository"}
 +	p, err := NewPolicy(c)
 +	require.NoError(t, err)
 +	pl := &Plan{Delegate: "pathops-tenant-control-plane", Details: []byte(`[
 +		{"type":"pathops_repository","tool":"forgejo","owner":"o","repository":"a","actions":["create","seed"]},
-+		{"type":"pathops_webhook","tool":"forgejo","owner":"o","repository":"a","events":["push"],
-+		 "url":"https://control-plane-c1.example/api/v1/webhooks/forgejo/x","actions":["configure"]},
 +		{"type":"pathops_repository","tool":"forgejo","owner":"o","repository":"b","actions":["create"]}]`)}
 +	got := p.Consent(pl)
 +	require.Len(t, got.Tools, 1)
@@ -1404,9 +1402,6 @@ index 0000000..4d4468e
 +	require.Len(t, tool.Repositories, 2)
 +	require.Equal(t, "o/a", tool.Repositories[0].Name)
 +	require.Equal(t, "o/b", tool.Repositories[1].Name)
-+	require.Len(t, tool.Webhooks, 1)
-+	require.Equal(t, "https://control-plane-c1.example/api/v1/webhooks/forgejo/x", tool.Webhooks[0].URL)
-+	require.Equal(t, []string{"push"}, tool.Webhooks[0].Events)
 +
 +	// A tool the configuration does not know has no URL or icon to show.
 +	unknown := p.Consent(&Plan{Delegate: "pathops-tenant-control-plane",
@@ -1819,10 +1814,10 @@ index 0000000..850437b
 +}
 diff --git a/server/delegation/plan.go b/server/delegation/plan.go
 new file mode 100644
-index 0000000..9bf5442
+index 0000000..4458845
 --- /dev/null
 +++ b/server/delegation/plan.go
-@@ -0,0 +1,472 @@
+@@ -0,0 +1,451 @@
 +package delegation
 +
 +import (
@@ -2178,7 +2173,6 @@ index 0000000..9bf5442
 +	// for a tool missing from the configuration.
 +	URL, IconURL string
 +	Repositories []ConsentRepository
-+	Webhooks     []ConsentWebhook
 +	// Other are details of other types, described generically.
 +	Other []string
 +}
@@ -2191,22 +2185,14 @@ index 0000000..9bf5442
 +	Summary string
 +}
 +
-+// ConsentWebhook is one webhook detail.
-+type ConsentWebhook struct {
-+	Repository, URL string
-+	Events          []string
-+	Actions         []ConsentAction
-+}
-+
 +// ConsentAction is an action and what it means.
 +type ConsentAction struct {
 +	Name, Meaning string
 +}
 +
 +var actionMeanings = map[string]string{
-+	"create":    "create it as a private repository",
-+	"seed":      "write the template's initial content to it",
-+	"configure": "configure it",
++	"create": "create it as a private repository",
++	"seed":   "write the template's initial content to it",
 +}
 +
 +func consentActions(actions []string) []ConsentAction {
@@ -2261,9 +2247,6 @@ index 0000000..9bf5442
 +				summary = strings.ToUpper(summary[:1]) + summary[1:] + "."
 +			}
 +			t.Repositories = append(t.Repositories, ConsentRepository{Name: repo, Actions: actions, Summary: summary})
-+		case "pathops_webhook":
-+			t.Webhooks = append(t.Webhooks, ConsentWebhook{Repository: repo, URL: str("url"),
-+				Events: eventList(m["events"]), Actions: consentActions(dt.Actions)})
 +		default:
 +			t.Other = append(t.Other, describe(dt, m))
 +		}
@@ -2285,15 +2268,6 @@ index 0000000..9bf5442
 +		parts = append(parts, fmt.Sprintf("%s=%v", k, m[k]))
 +	}
 +	return strings.Join(parts, " ")
-+}
-+
-+func eventList(v any) []string {
-+	list, _ := v.([]any)
-+	s := make([]string, 0, len(list))
-+	for _, e := range list {
-+		s = append(s, fmt.Sprint(e))
-+	}
-+	return s
 +}
 diff --git a/server/discovery/discovery.go b/server/discovery/discovery.go
 index d9119d4..2773ca1 100644
@@ -2646,10 +2620,10 @@ index 6433b61..4985756 100644
  			Storage:     s.storage,
 diff --git a/server/server_delegation_test.go b/server/server_delegation_test.go
 new file mode 100644
-index 0000000..92f588d
+index 0000000..6d9cc87
 --- /dev/null
 +++ b/server/server_delegation_test.go
-@@ -0,0 +1,729 @@
+@@ -0,0 +1,728 @@
 +package server
 +
 +import (
@@ -2675,16 +2649,15 @@ index 0000000..92f588d
 +)
 +
 +const (
-+	dlgCLI         = "pathops-cli"
-+	dlgTCP         = "pathops-tenant-control-plane"
-+	dlgTCPSecret   = "tcp-secret"
-+	dlgOther       = "other-confidential"
-+	dlgRedirect    = "http://127.0.0.1:5555/callback"
-+	dlgPlanIssuer  = "https://tcp.example.test"
-+	dlgAudience    = "u:7:2f0c6a51-8d7e-4b8e-9c55-3a2f0e9b1c44"
-+	dlgMockUserID  = "0-385-28089-0"
-+	dlgWebhookBase = "https://control-plane-test.example/api/v1/webhooks/forgejo/"
-+	dlgForgejoURL  = "https://forgejo-test.example"
++	dlgCLI        = "pathops-cli"
++	dlgTCP        = "pathops-tenant-control-plane"
++	dlgTCPSecret  = "tcp-secret"
++	dlgOther      = "other-confidential"
++	dlgRedirect   = "http://127.0.0.1:5555/callback"
++	dlgPlanIssuer = "https://tcp.example.test"
++	dlgAudience   = "u:7:2f0c6a51-8d7e-4b8e-9c55-3a2f0e9b1c44"
++	dlgMockUserID = "0-385-28089-0"
++	dlgForgejoURL = "https://forgejo-test.example"
 +)
 +
 +type dlgEnv struct {
@@ -2718,7 +2691,7 @@ index 0000000..92f588d
 +				Client: dlgTCP, Name: "PathOps Tenant Control Plane (test)", PlanIssuer: dlgPlanIssuer,
 +				PlanKeys: []delegation.KeyConfig{{KeyID: "plan-1", Ed25519: base64.RawURLEncoding.EncodeToString(pub)}},
 +				Tools: []delegation.ToolConfig{{Name: "forgejo", DisplayName: "Forgejo", URL: dlgForgejoURL, IconURL: dlgForgejoURL + "/assets/img/logo.svg",
-+					AudiencePattern: `u:[0-9]+:[0-9a-f-]{36}`, DetailTypes: []string{"pathops_repository", "pathops_webhook"}}},
++					AudiencePattern: `u:[0-9]+:[0-9a-f-]{36}`, DetailTypes: []string{"pathops_repository"}}},
 +			}},
 +		})
 +		require.NoError(t, err)
@@ -2745,8 +2718,8 @@ index 0000000..92f588d
 +	}
 +	return []map[string]any{
 +		repo(app), repo(app + "-gitops-preflight"), repo(app + "-gitops-production"),
-+		{"type": "pathops_webhook", "version": 1, "tool": "forgejo", "owner": owner, "repository": app,
-+			"url": dlgWebhookBase + appID, "events": []string{"push"}, "actions": []string{"configure"}},
++		{"type": "pathops_repository", "version": 1, "tool": "forgejo", "owner": owner, "repository": app + "-extra",
++			"actions": []string{"create"}},
 +	}
 +}
 +
@@ -3009,7 +2982,7 @@ index 0000000..92f588d
 +
 +	page, approval := e.consent(e.requestURI(plan, raw, pk))
 +	for _, want := range []string{"PathOps Tenant Control Plane (test)", "Create an application: <code>app-a</code>",
-+		"<code>CREATE_APPLICATION</code>", "<h3>Repositories</h3>", "<h3>Webhook</h3>",
++		"<code>CREATE_APPLICATION</code>", "<h3>Repositories</h3>",
 +		`<section class="pc-tool-group" data-tool="forgejo">`, `<p class="pc-tool-name">Forgejo</p>`,
 +		`<a href="` + dlgForgejoURL + `" target="_blank" rel="noopener noreferrer"><code>` + dlgForgejoURL + `</code></a>`,
 +		`<img class="pc-tool-icon" src="` + dlgForgejoURL + `/assets/img/logo.svg" alt=""`, `referrerpolicy="no-referrer"`,
@@ -3019,8 +2992,7 @@ index 0000000..92f588d
 +		`<span class="pc-chip" title="create it as a private repository">create</span>`,
 +		`<span class="pc-chip" title="write the template&#39;s initial content to it">seed</span>`,
 +		"Create it as a private repository and write the template&#39;s initial content to it.",
-+		`<span class="pc-chip">push</span>`, "<code>" + dlgWebhookBase + "app-id-app-a</code>",
-+		`<span class="pc-chip" title="configure it">configure</span>`,
++		`<code class="pc-name">kilgore/app-a-extra</code>`, "Create it as a private repository.",
 +		"<code>generic-container</code> from <code>https://github.com/PathOps/pathops-templates</code> @ <code>main</code>",
 +		"<code>33333333-2222-4333-8444-cccccccccccc</code>", "<code>" + id + "</code>",
 +		"<strong>15 minutes</strong>", "<strong>5 minutes</strong>",
@@ -3112,12 +3084,13 @@ index 0000000..92f588d
 +	one, _ := delegation.Canonical([]byte(mustJSON(t, details[:1])))
 +	require.JSONEq(t, string(one), mustJSON(t, c["authorization_details"]))
 +
-+	// The webhook Step gets only the webhook detail.
++	// Another Step gets only its own detail.
 +	rr = e.derive(handle, dlgAudience, details[3:])
 +	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
 +	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &dr))
 +	require.Len(t, jwtClaims(t, dr.AccessToken)["authorization_details"], 1)
-+	require.Equal(t, "pathops_webhook", jwtClaims(t, dr.AccessToken)["authorization_details"].([]any)[0].(map[string]any)["type"])
++	require.Equal(t, "kilgore", jwtClaims(t, dr.AccessToken)["authorization_details"].([]any)[0].(map[string]any)["owner"])
++	require.Equal(t, []any{"create"}, jwtClaims(t, dr.AccessToken)["authorization_details"].([]any)[0].(map[string]any)["actions"])
 +
 +	// Negative derivations.
 +	other := dlgDetails("kilgore", "app-b", "app-id-app-b")
@@ -3136,7 +3109,7 @@ index 0000000..92f588d
 +		"wrong secret":          {handle, dlgAudience, details[:1], []string{dlgTCP, "nope"}, 401, "invalid_client"},
 +		"not a delegate":        {handle, dlgAudience, details[:1], []string{dlgOther, "other-secret"}, 400, "unauthorized_client"},
 +		"another application":   {handle, dlgAudience, other[:1], nil, 400, "invalid_authorization_details"},
-+		"another app's webhook": {handle, dlgAudience, other[3:], nil, 400, "invalid_authorization_details"},
++		"another app's detail":  {handle, dlgAudience, other[3:], nil, 400, "invalid_authorization_details"},
 +		"widened action":        {handle, dlgAudience, widened, nil, 400, "invalid_authorization_details"},
 +		"empty":                 {handle, dlgAudience, []map[string]any{}, nil, 400, "invalid_authorization_details"},
 +		"wrong audience":        {handle, "u:8:2f0c6a51-8d7e-4b8e-9c55-3a2f0e9b1c44", details[:1], nil, 400, "invalid_target"},
@@ -3325,7 +3298,7 @@ index 0000000..92f588d
 +	var d map[string]any
 +	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &d))
 +	require.Equal(t, e.issuer+"/par", d["pushed_authorization_request_endpoint"])
-+	require.Equal(t, []any{"pathops_repository", "pathops_webhook"}, d["authorization_details_types_supported"])
++	require.Equal(t, []any{"pathops_repository"}, d["authorization_details_types_supported"])
 +}
 +
 +// With Dex sessions, one login serves later operations: the next plan's
@@ -3693,10 +3666,10 @@ index 84976c5..f1964f5 100644
  // RefreshToken is an OAuth2 refresh token which allows a client to request new
 diff --git a/web/templates/delegation.html b/web/templates/delegation.html
 new file mode 100644
-index 0000000..9379175
+index 0000000..d85883b
 --- /dev/null
 +++ b/web/templates/delegation.html
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,141 @@
 +{{ template "header.html" . }}
 +
 +<style>
@@ -3778,24 +3751,6 @@ index 0000000..9379175
 +              <span class="pc-chips">{{ range .Actions }}<span class="pc-chip" title="{{ .Meaning }}">{{ .Name }}</span>{{ end }}</span>
 +            </div>
 +            <p class="pc-note">{{ .Summary }}</p>
-+          </li>
-+          {{ end }}
-+        </ul>
-+      </div>
-+      {{ end }}
-+
-+      {{ with .Webhooks }}
-+      <div class="pc-section">
-+        <h3>{{ if gt (len .) 1 }}Webhooks{{ else }}Webhook{{ end }}</h3>
-+        <ul class="pc-list">
-+          {{ range . }}
-+          <li class="pc-item">
-+            <dl class="pc-facts">
-+              <dt>Repository</dt><dd><code class="pc-name">{{ .Repository }}</code></dd>
-+              <dt>Events</dt><dd><span class="pc-chips">{{ range .Events }}<span class="pc-chip">{{ . }}</span>{{ end }}</span></dd>
-+              <dt>Destination</dt><dd><code>{{ .URL }}</code></dd>
-+              <dt>Actions</dt><dd><span class="pc-chips">{{ range .Actions }}<span class="pc-chip" title="{{ .Meaning }}">{{ .Name }}</span>{{ end }}</span></dd>
-+            </dl>
 +          </li>
 +          {{ end }}
 +        </ul>

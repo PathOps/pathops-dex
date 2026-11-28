@@ -1,8 +1,8 @@
-From c6df09217c336b84066838b99680726217ca4226 Mon Sep 17 00:00:00 2001
+From 44f7ecc4e95c23de8587fa9a45f3e839482ec5c5 Mon Sep 17 00:00:00 2001
 From: PathOps <noreply@pathops.dev>
 Date: Sat, 7 Nov 2026 23:49:54 -0300
-Subject: [PATCH 5/6] delegation: show BUILD_AND_PUSH credentials and
- Kubernetes objects on the consent screen
+Subject: [PATCH] delegation: show BUILD_AND_PUSH credentials and Kubernetes
+ objects on the consent screen
 
 PathOps Decision 0056 adds three detail types to the create-app plan: a
 Forgejo repository read token (pathops_repository_token), a read-only
@@ -14,17 +14,17 @@ the repository, key title and whether it is read-only; the object's
 kind and namespace/name. Action meanings depend on the detail type
 ("create" a repository, a token or an object).
 ---
- server/delegation/delegation_test.go | 30 ++++++++++++
- server/delegation/plan.go            | 71 +++++++++++++++++++++++++++-
- server/templates/templates_test.go   | 40 +++++++++++++++-
- web/templates/delegation.html        | 54 +++++++++++++++++++++
- 4 files changed, 193 insertions(+), 2 deletions(-)
+ server/delegation/delegation_test.go | 30 +++++++++++
+ server/delegation/plan.go            | 81 +++++++++++++++++++++++++++-
+ server/templates/templates_test.go   | 40 +++++++++++++-
+ web/templates/delegation.html        | 54 +++++++++++++++++++
+ 4 files changed, 203 insertions(+), 2 deletions(-)
 
 diff --git a/server/delegation/delegation_test.go b/server/delegation/delegation_test.go
-index 4d4468e..2b2084f 100644
+index 02b158f..1357897 100644
 --- a/server/delegation/delegation_test.go
 +++ b/server/delegation/delegation_test.go
-@@ -102,3 +102,33 @@ func TestConsentGroupsByTool(t *testing.T) {
+@@ -97,3 +97,33 @@ func TestConsentGroupsByTool(t *testing.T) {
  	require.Len(t, unknown.Tools, 1)
  	require.Equal(t, ConsentTool{Name: "elsewhere", DisplayName: "elsewhere", Other: []string{"x_thing read"}}, unknown.Tools[0])
  }
@@ -59,13 +59,13 @@ index 4d4468e..2b2084f 100644
 +	require.Empty(t, k8s.Other)
 +}
 diff --git a/server/delegation/plan.go b/server/delegation/plan.go
-index b560be1..3c05ace 100644
+index 4458845..e302a16 100644
 --- a/server/delegation/plan.go
 +++ b/server/delegation/plan.go
-@@ -351,10 +351,40 @@ type ConsentTool struct {
+@@ -353,10 +353,40 @@ type ConsentTool struct {
+ 	// for a tool missing from the configuration.
  	URL, IconURL string
  	Repositories []ConsentRepository
- 	Webhooks     []ConsentWebhook
 +	// RepositoryTokens and DeployKeys are a repository's read-only
 +	// credentials (PathOps BUILD_AND_PUSH); KubernetesResources the
 +	// Kubernetes objects the operation creates.
@@ -103,14 +103,13 @@ index b560be1..3c05ace 100644
  // ConsentRepository is one repository detail.
  type ConsentRepository struct {
  	Name    string
-@@ -378,13 +408,35 @@ type ConsentAction struct {
+@@ -373,12 +403,34 @@ type ConsentAction struct {
  var actionMeanings = map[string]string{
- 	"create":    "create it as a private repository",
- 	"seed":      "write the template's initial content to it",
-+	"read":      "read its content",
- 	"configure": "configure it",
- }
- 
+ 	"create": "create it as a private repository",
+ 	"seed":   "write the template's initial content to it",
++	"read":   "read its content",
++}
++
 +// Meanings of actions that differ by detail type.
 +var typeActionMeanings = map[string]map[string]string{
 +	"pathops_repository_token": {
@@ -123,8 +122,8 @@ index b560be1..3c05ace 100644
 +	"pathops_kubernetes_resource": {
 +		"create": "create this object",
 +	},
-+}
-+
+ }
+ 
  func consentActions(actions []string) []ConsentAction {
 +	return typedConsentActions("", actions)
 +}
@@ -140,13 +139,13 @@ index b560be1..3c05ace 100644
  		if m == "" {
  			m = a
  		}
-@@ -436,6 +488,23 @@ func (p *Policy) Consent(pl *Plan) Consent {
- 		case "pathops_webhook":
- 			t.Webhooks = append(t.Webhooks, ConsentWebhook{Repository: repo, URL: str("url"),
- 				Events: eventList(m["events"]), Actions: consentActions(dt.Actions)})
+@@ -427,6 +479,23 @@ func (p *Policy) Consent(pl *Plan) Consent {
+ 				summary = strings.ToUpper(summary[:1]) + summary[1:] + "."
+ 			}
+ 			t.Repositories = append(t.Repositories, ConsentRepository{Name: repo, Actions: actions, Summary: summary})
 +		case "pathops_repository_token":
 +			t.RepositoryTokens = append(t.RepositoryTokens, ConsentRepositoryToken{Repository: repo, Name: str("name"),
-+				Scopes: eventList(m["scopes"]), Actions: typedConsentActions(dt.Type, dt.Actions)})
++				Scopes: stringList(m["scopes"]), Actions: typedConsentActions(dt.Type, dt.Actions)})
 +		case "pathops_deploy_key":
 +			readOnly, _ := m["read_only"].(bool)
 +			t.DeployKeys = append(t.DeployKeys, ConsentDeployKey{Repository: repo, Title: str("title"), ReadOnly: readOnly,
@@ -164,6 +163,20 @@ index b560be1..3c05ace 100644
  		default:
  			t.Other = append(t.Other, describe(dt, m))
  		}
+@@ -449,3 +518,13 @@ func describe(dt detail, m map[string]any) string {
+ 	}
+ 	return strings.Join(parts, " ")
+ }
++
++// stringList is a JSON array's elements as strings.
++func stringList(v any) []string {
++	list, _ := v.([]any)
++	s := make([]string, 0, len(list))
++	for _, e := range list {
++		s = append(s, fmt.Sprint(e))
++	}
++	return s
++}
 diff --git a/server/templates/templates_test.go b/server/templates/templates_test.go
 index eb2d54b..627f5a5 100644
 --- a/server/templates/templates_test.go
@@ -219,10 +232,10 @@ index eb2d54b..627f5a5 100644
 +	}
 +}
 diff --git a/web/templates/delegation.html b/web/templates/delegation.html
-index 9379175..d2776c9 100644
+index d85883b..fa2127b 100644
 --- a/web/templates/delegation.html
 +++ b/web/templates/delegation.html
-@@ -103,6 +103,60 @@
+@@ -85,6 +85,60 @@
        </div>
        {{ end }}
  

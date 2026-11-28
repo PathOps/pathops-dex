@@ -1,4 +1,4 @@
-From 87bb1b3a1138a3cc4e7e1f6ea453c23c1f9fd23c Mon Sep 17 00:00:00 2001
+From 30f0a94bcbdc1029c4ffb42660babb0c3c082dfb Mon Sep 17 00:00:00 2001
 From: PathOps <noreply@pathops.dev>
 Date: Fri, 6 Nov 2026 04:09:06 -0300
 Subject: [PATCH] sessions: read the cookie encryption key from the environment
